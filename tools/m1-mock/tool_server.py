@@ -807,13 +807,17 @@ def tool_apply(args, user):
             return cached["result"]
         if cached["state"] == "applying":
             raise ToolError("IDEMPOTENCY_IN_PROGRESS", "同一请求正在处理中。", retryable=True)
-        verify_readback(p)
-        cached["state"] = "done"
-        return cached["result"]
+        raise ToolError("READBACK_PENDING", "仍在等待权威回读，请不要再次写入。",
+                        [{"field": "proposal_status", "reason": "readback_pending"},
+                         {"field": "business_write_count_delta", "reason": "0"},
+                         {"field": "operation", "reason": "readback_only"}],
+                        retryable=True)
 
     if p["status"] in ("applying", "readback_pending"):
         raise ToolError("READBACK_PENDING", "写入可能已发生，只能用同一幂等键继续回读。",
-                        [{"field": "proposal.status", "reason": "readback_pending"}])
+                        [{"field": "proposal_status", "reason": p["status"]},
+                         {"field": "business_write_count_delta", "reason": "0"}],
+                        retryable=True)
     if pid in STATE["applied_proposals"]:
         raise ToolError("ALREADY_APPLIED", "该提案已成功应用。")
     if p["status"] == "failed":
@@ -895,7 +899,8 @@ def tool_apply(args, user):
     if rec:
         rec["token_consumed"] = True
     result = {"proposal_id": pid, "base_version": base_version,
-              "result_version": _next_id("ver"), "idempotency_key": key,
+              "result_version": _next_id("ver"), "proposal_status": "applied",
+              "idempotency_key": key,
               "applied_changes": applied, "readback_verified": True,
               "applied_at": iso(now())}
 
@@ -903,7 +908,17 @@ def tool_apply(args, user):
         p["status"] = "readback_pending"
         STATE["idempotency"][idem] = {"digest": req_digest, "state": "readback_pending", "result": result}
         raise ToolError("READBACK_PENDING", "写入可能已提交但回读未完成。",
-                        [{"field": "proposal.status", "reason": "readback_pending"}])
+                        [{"field": "proposal_status", "reason": "readback_pending"},
+                         {"field": "business_write_count_delta", "reason": "0"}],
+                        retryable=True)
+
+    if take_flag("confirmed_mismatch"):
+        p["status"] = "failed"
+        raise ToolError("READBACK_MISMATCH", "权威回读与批准内容不一致，提案已终止。",
+                        [{"field": "proposal_status", "reason": "failed"},
+                         {"field": "operation", "reason": "readback_only"},
+                         {"field": "business_write_count_delta", "reason": "0"},
+                         {"field": "second_apply_executed", "reason": "false"}])
 
     p["status"] = "applied"
     verify_readback(p)

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """M1 evidence aligned to contract c53b1a9 (separate from earlier baselines).
 
-Writes docs/contracts/reviews/m1-evidence-c53b1a9.md/.json.
+Writes docs/contracts/reviews/m1-evidence-c9dda83.md/.json.
 Covers: schema/envelope, explanations closed set, R1, X1, ordering, EX-17
 (APPROVAL_UNTRUSTED vs APPROVAL_CONSUMED), idempotency-in-progress,
 EX-01..EX-20 replay with raw response records and write counters.
@@ -155,8 +155,10 @@ def main():
     t2 = token(c, aid2)
     r = c.call("apply_approved_changes", {"proposal_id": p["proposal_id"], "base_version": p["base_version"],
                                           "approval_token": t2, "idempotency_key": "r1a2"})
-    rec("R1-3 新 Token 成功应用", data(r) is not None, "success", code(r) or "success",
-        raw={"applied": len(data(r)["applied_changes"]) if data(r) else 0})
+    rd = data(r) or {}
+    rec("R1-3 新 Token 成功应用（proposal_status=applied）",
+        rd.get("proposal_status") == "applied", "applied", rd.get("proposal_status"),
+        raw={"applied": len(rd.get("applied_changes", []))})
     c.close()
 
     # X1 with counters
@@ -170,9 +172,44 @@ def main():
     w_before = writes()
     r = c.call("apply_approved_changes", {"proposal_id": p["proposal_id"], "base_version": p["base_version"],
                                           "approval_token": t, "idempotency_key": "x1a2"})
-    rec("X1-1 新幂等键 → READBACK_PENDING 且零写入",
-        code(r) == "READBACK_PENDING" and writes() == w_before, "READBACK_PENDING, writes 0",
-        f"{code(r)}, writes={writes()-w_before}", raw={"writes_delta": writes() - w_before})
+    det = sc(r).get("error", {}).get("details", [])
+    fields = {d.get("field"): d.get("reason") for d in det}
+    err = sc(r).get("error", {})
+    ok = (code(r) == "READBACK_PENDING" and writes() == w_before
+          and fields.get("proposal_status") == "readback_pending"
+          and fields.get("business_write_count_delta") == "0"
+          and err.get("retryable") is True)
+    rec("X1-1 新键 → READBACK_PENDING（proposal_status/retryable/零写入）", ok,
+        "READBACK_PENDING, proposal_status=readback_pending, delta=0, retryable=true, writes 0",
+        f"{code(r)}, details={fields}, retryable={err.get('retryable')}, writes={writes()-w_before}",
+        raw={"writes_delta": writes() - w_before, "details": det})
+
+    w2 = writes()
+    r2 = c.call("apply_approved_changes", {"proposal_id": p["proposal_id"], "base_version": p["base_version"],
+                                           "approval_token": t, "idempotency_key": "x1a1"})
+    det2 = sc(r2).get("error", {}).get("details", [])
+    f2 = {d.get("field"): d.get("reason") for d in det2}
+    rec("X1-2 同键重试 → 只回读（operation=readback_only）且零写入",
+        code(r2) == "READBACK_PENDING" and f2.get("operation") == "readback_only"
+        and f2.get("business_write_count_delta") == "0" and writes() == w2,
+        "READBACK_PENDING readback_only, writes 0",
+        f"{code(r2)}, details={f2}, writes={writes()-w2}", raw={"details": det2})
+    c.close()
+
+    # X2 confirmed mismatch -> READBACK_MISMATCH / failed
+    c = Client()
+    p, aid = pending(c, "x2k1")
+    t = token(c, aid)
+    set_flags({"confirmed_mismatch": True})
+    r = c.call("apply_approved_changes", {"proposal_id": p["proposal_id"], "base_version": p["base_version"],
+                                          "approval_token": t, "idempotency_key": "x2a1"})
+    det = sc(r).get("error", {}).get("details", [])
+    fields = {d.get("field"): d.get("reason") for d in det}
+    rec("X2 权威回读不一致 → READBACK_MISMATCH(failed, 零写入)",
+        code(r) == "READBACK_MISMATCH" and fields.get("proposal_status") == "failed"
+        and fields.get("second_apply_executed") == "false",
+        "READBACK_MISMATCH, proposal_status=failed, second_apply=false",
+        f"{code(r)}, details={fields}", raw={"details": det})
     c.close()
 
     # T1 cross-proposal token
@@ -244,17 +281,17 @@ def main():
 
     passed = sum(1 for x in results if x["pass"])
     exp = sum(1 for x in ex if x["status"] == "pass")
-    summary = {"contract": "c53b1a91c17cd9acdee6d3937c093fcf97515ba0",
+    summary = {"contract": "c9dda83195a9af4b9ca762d8556fdd0e8d43010a",
                "core": {"passed": passed, "total": len(results), "results": results},
                "examples": {"passed": exp, "total": len(ex), "results": ex}}
     os.makedirs(OUT_DIR, exist_ok=True)
-    json.dump(summary, open(os.path.join(OUT_DIR, "m1-evidence-c53b1a9.json"), "w", encoding="utf-8"),
+    json.dump(summary, open(os.path.join(OUT_DIR, "m1-evidence-c9dda83.json"), "w", encoding="utf-8"),
               ensure_ascii=False, indent=1)
 
-    lines = ["# M1 证据 · 契约 c53b1a9", "",
-             "基准：`c53b1a91c17cd9acdee6d3937c093fcf97515ba0`（PR #4）",
+    lines = ["# M1 证据 · 契约 c9dda83", "",
+             "基准：`c9dda83195a9af4b9ca762d8556fdd0e8d43010a`（PR #4）",
              f"核心 {passed}/{len(results)}；EX {exp}/{len(ex)}；环境 Windows / Python {platform.python_version()} / MCP stdio",
-             "", "> 与 2c48579 及 26/26 证据分开统计；WorkBuddy 实机另见 `m1-workbuddy-live.md`。", "",
+             "", "> 与 2c48579、c53b1a9 及 26/26 证据分开统计；WorkBuddy 实机另见 `m1-workbuddy-live.md`。", "",
              "## 核心", "", "| 用例 | 预期 | 实际 | 结论 | 说明 |", "|---|---|---|---|---|"]
     for x in results:
         lines.append(f"| {x['case']} | {x['expected']} | {x['got']} | {'✅' if x['pass'] else '❌'} | {x['note']} |")
@@ -262,7 +299,7 @@ def main():
     for x in ex:
         mark = {"pass": "✅", "fail": "❌", "not_executable": "⏸️"}[x["status"]]
         lines.append(f"| {x['id']} | {x['name']} | {mark} {x['status']} | {x['note']} |")
-    open(os.path.join(OUT_DIR, "m1-evidence-c53b1a9.md"), "w", encoding="utf-8").write("\n".join(lines))
+    open(os.path.join(OUT_DIR, "m1-evidence-c9dda83.md"), "w", encoding="utf-8").write("\n".join(lines))
     print(f"core {passed}/{len(results)}; EX {exp}/{len(ex)}")
 
 
@@ -478,9 +515,13 @@ def ex_readback(ex):
     set_flags({"readback_mismatch": True})
     r = c.call("apply_approved_changes", {"proposal_id": p["proposal_id"], "base_version": p["base_version"],
                                           "approval_token": t, "idempotency_key": "exrb1"})
-    ok = code(r) == "READBACK_PENDING"
+    det = sc(r).get("error", {}).get("details", [])
+    f = {d.get("field"): d.get("reason") for d in det}
+    err = sc(r).get("error", {})
+    ok = (code(r) == "READBACK_PENDING" and f.get("proposal_status") == "readback_pending"
+          and f.get("business_write_count_delta") == "0" and err.get("retryable") is True)
     c.close()
-    return ok, f"code={code(r)}", {"code": code(r)}
+    return ok, f"code={code(r)}, proposal_status={f.get('proposal_status')}, retryable={err.get('retryable')}", {"details": det}
 
 
 EX_ORDER = [
