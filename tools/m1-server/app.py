@@ -121,6 +121,78 @@ def _fp(secret):
     return hashlib.sha256(secret.encode("utf-8")).hexdigest()[:8]
 
 
+def _env_diag():
+    """只读环境诊断。回答"容器能不能跑第二个进程"这一类问题，用实测替代推测。
+
+    约束：不返回任何口令值；不监听任何端口（只 bind 后立即关闭）；不写文件时
+    只试一次临时文件并删除；所有外部动作都有超时，失败即记 False 而不抛异常。
+    """
+    import platform
+    import shutil
+    import socket
+    import subprocess
+    import tempfile
+
+    diag = {
+        "os": {"platform": sys.platform, "release": platform.release(),
+               "machine": platform.machine(), "python": platform.python_version()},
+        "cpu_count": os.cpu_count(),
+    }
+
+    # 1) 有没有可用的子进程运行时：先看可执行文件在不在，再真跑一次。
+    binaries = ("dart", "flutter", "node", "git", "bash", "sh", "curl", "java")
+    diag["binaries"] = {b: shutil.which(b) for b in binaries}
+    spawn = {"ok": False}
+    try:
+        p = subprocess.run([sys.executable, "-c", "print('spawn-ok')"],
+                           capture_output=True, text=True, timeout=10)
+        spawn = {"ok": p.returncode == 0,
+                 "stdout": (p.stdout or "").strip()[:40],
+                 "returncode": p.returncode}
+    except Exception as e:                                   # noqa: BLE001
+        spawn = {"ok": False, "error": type(e).__name__}
+    diag["subprocess"] = spawn
+
+    # 2) 回环端口能否监听（第二个进程要靠它把引擎挂起来）。
+    loop = {"ok": False}
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind(("127.0.0.1", 0))
+        s.listen(1)
+        loop = {"ok": True, "port": s.getsockname()[1]}
+        s.close()
+    except Exception as e:                                   # noqa: BLE001
+        loop = {"ok": False, "error": type(e).__name__}
+    diag["loopback_listen"] = loop
+
+    # 3) 出站能不能连出去（决定构建期能否拉依赖；只测连接，不发数据）。
+    egress = {}
+    for host, port in (("1.1.1.1", 443), ("pypi.org", 443),
+                       ("pub.dev", 443), ("storage.googleapis.com", 443),
+                       ("raw.githubusercontent.com", 443), ("github.com", 443)):
+        try:
+            s = socket.create_connection((host, port), timeout=4)
+            egress["%s:%d" % (host, port)] = True
+            s.close()
+        except Exception as e:                               # noqa: BLE001
+            egress["%s:%d" % (host, port)] = type(e).__name__
+    diag["egress"] = egress
+
+    # 4) 工作目录是否可写（引擎二进制要落盘）。
+    try:
+        with tempfile.NamedTemporaryFile(dir=os.getcwd(), delete=True):
+            diag["cwd_writable"] = True
+    except Exception:                                        # noqa: BLE001
+        diag["cwd_writable"] = False
+    diag["cwd"] = os.getcwd()
+
+    # 5) 只报环境变量名，不报值。
+    diag["env_keys"] = sorted(k for k in os.environ
+                              if k.startswith("CHECKD_") or k in ("BIND", "PORT", "PATH"))
+    return diag
+
+
 def _reset_demo_state():
     """重新加载 mock 模块，回到源码里的初始 fixture。
 
@@ -427,6 +499,15 @@ class Handler(BaseHTTPRequestHandler):
                 "calls": _STATS["calls"],
                 "errors": _STATS["errors"],
             })
+            return
+
+        if path == "/diag":
+            # 只读环境诊断，仅管理凭证可读，且不返回任何口令值。
+            # 用途：回答 M2 2026-11-05 16:54:03Z 的三个问题（能否跑第二进程 /
+            # 容器里有没有 dart / 回环端口能否监听），用实测替代推测。
+            if not self._admin_ok():
+                return
+            self._send(200, _env_diag())
             return
 
         if path == "/tools":
