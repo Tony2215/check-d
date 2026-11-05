@@ -30,6 +30,8 @@ import threading
 import time
 import traceback
 import uuid
+import hmac
+from collections import deque
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -53,6 +55,56 @@ _LOCK = threading.Lock()
 _STATS = {"starts_at": None, "calls": 0, "errors": 0}
 _EVIDENCE = []          # 最近 500 条工具调用
 _EVIDENCE_CAP = 500
+
+# ---------------------------------------------------------------- 防护
+# 2026-11-05 用户要求「公网那边被攻击了别影响到我」。
+# 四道闸，全部可用环境变量收紧，默认值按公网部署的保守面取：
+#   1) body 上限    —— 防超大 payload 打爆内存
+#   2) 滑动窗口限流 —— 防刷；管理端点额度更小
+#   3) socket 超时  —— 防慢速连接耗尽线程
+#   4) health 精简  —— 公网不暴露 bind/port/口令指纹
+# 说明：这些都不改变契约内的 21 个错误码闭集，限流复用 DEPENDENCY_UNAVAILABLE(503)。
+MAX_BODY_BYTES = int(os.environ.get("CHECKD_MAX_BODY", "262144"))        # 256 KiB
+RATE_LIMIT_PER_MIN = int(os.environ.get("CHECKD_RATE_PER_MIN", "120"))
+# 管理端点是"脚本在调"不是"人在点"，额度要给够：一次完整闭环会连打 reset + demo_confirm。
+RATE_LIMIT_ADMIN_PER_MIN = int(os.environ.get("CHECKD_RATE_ADMIN_PER_MIN", "60"))
+SOCKET_TIMEOUT = float(os.environ.get("CHECKD_SOCKET_TIMEOUT", "15"))
+HEALTH_MINIMAL = os.environ.get("CHECKD_HEALTH_MINIMAL", "1") == "1"
+
+_RATE = {}              # (ip, bucket) -> deque[monotonic ts]
+_RATE_LOCK = threading.Lock()
+
+
+def _rate_ok(ip, limit, bucket="biz"):
+    """滑动窗口计数。True = 放行；False = 已超限。
+
+    **按 (IP, 类别) 分别计数**。2026-11-05 实测踩到的坑：起初只按 IP 记一个 deque，
+    结果业务请求把窗口塞满后，管理端点（额度更小）被连带拒掉——
+    demo_loop 的 admin/reset 与 demo/confirm 双双 503，链路在第 5、7 步断。
+    两类流量必须各自成桶，否则收紧 A 就等于误伤 B。
+    """
+    now = time.monotonic()
+    cutoff = now - 60.0
+    key = (ip, bucket)
+    with _RATE_LOCK:
+        dq = _RATE.get(key)
+        if dq is None:
+            dq = _RATE[key] = deque()
+        while dq and dq[0] < cutoff:
+            dq.popleft()
+        if len(dq) >= limit:
+            return False
+        dq.append(now)
+        if len(_RATE) > 4096:          # 防字典无限增长（长跑场景）
+            for k in [k for k, v in list(_RATE.items()) if not v][:1024]:
+                _RATE.pop(k, None)
+    return True
+
+
+class _BodyTooLarge(Exception):
+    def __init__(self, size):
+        super().__init__(size)
+        self.size = size
 
 
 # ---------------------------------------------------------------- 工具函数
@@ -229,6 +281,8 @@ def _mcp_handle(msg):
 class Handler(BaseHTTPRequestHandler):
     server_version = "%s/%s" % (SERVICE_NAME, SERVICE_VERSION)
     protocol_version = "HTTP/1.1"
+    # 单连接读超时：慢速发 body 的连接到点即断，不会一直占着线程。
+    timeout = SOCKET_TIMEOUT
 
     # ---- 基础工具
 
@@ -259,8 +313,40 @@ class Handler(BaseHTTPRequestHandler):
             n = 0
         if n <= 0:
             return {}
+        if n > MAX_BODY_BYTES:
+            # 一个字节都不读：读了才拒等于自己先吃掉一次攻击。
+            raise _BodyTooLarge(n)
         raw = self.rfile.read(n).decode("utf-8")
         return json.loads(raw)
+
+    def _body_too_large(self, exc):
+        self._fail(413, "INVALID_ARGUMENT",
+                   "请求体超过上限 %d 字节（收到 %d）。" % (MAX_BODY_BYTES, exc.size))
+
+    def _rate_check(self):
+        """按 IP + 类别限流。管理端点单独成桶，额度独立。"""
+        ip = self.client_address[0] if self.client_address else "-"
+        path = self.path.split("?")[0]
+        admin_like = path.startswith("/admin/") or path == "/demo/confirm"
+        if admin_like:
+            limit, bucket = RATE_LIMIT_ADMIN_PER_MIN, "admin"
+        else:
+            limit, bucket = RATE_LIMIT_PER_MIN, "biz"
+        if _rate_ok(ip, limit, bucket):
+            return True
+        # 契约闭集里没有专门的限流码，复用 DEPENDENCY_UNAVAILABLE(503)；
+        # 额外带 Retry-After 让客户端知道多久后重试。
+        self.send_response(503)
+        body = errs.to_envelope("DEPENDENCY_UNAVAILABLE", "请求过于频繁，请稍后再试。",
+                                request_id=None, trace_id=uuid.uuid4().hex[:16])
+        raw = json.dumps(body, ensure_ascii=False).encode("utf-8")
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(raw)))
+        self.send_header("Retry-After", "60")
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(raw)
+        return False
 
     def _candidates(self):
         """收集所有可能承载口令的头。
@@ -288,7 +374,12 @@ class Handler(BaseHTTPRequestHandler):
             self._fail(503, "DEPENDENCY_UNAVAILABLE",
                        "服务未配置访问口令，已按失败即关闭处理。")
             return False
-        if DEMO_TOKEN not in self._candidates():
+        # 常量时间比对：逐个候选走 compare_digest，不用 in / == 提前返回。
+        ok = False
+        for cand in self._candidates():
+            if hmac.compare_digest(cand, DEMO_TOKEN):
+                ok = True
+        if not ok:
             self._fail(401, "APPROVAL_UNTRUSTED", "凭证无效。")
             return False
         return True
@@ -297,7 +388,7 @@ class Handler(BaseHTTPRequestHandler):
         if not ADMIN_KEY:
             self._fail(404, "NOT_FOUND", "该端点未启用。")
             return False
-        if (self.headers.get("X-Admin-Key") or "") != ADMIN_KEY:
+        if not hmac.compare_digest(self.headers.get("X-Admin-Key") or "", ADMIN_KEY):
             self._fail(401, "APPROVAL_UNTRUSTED", "管理凭证无效。")
             return False
         return True
@@ -311,7 +402,12 @@ class Handler(BaseHTTPRequestHandler):
         path = self.path.split("?")[0]
 
         if path in ("/", "/health"):
-            # 健康检查不鉴权，但不泄露演示数据细节。
+            # 健康检查不鉴权，但也不给攻击者任何可用情报。
+            # CHECKD_HEALTH_MINIMAL=1（公网默认）只回三样：活着、叫什么、什么版本。
+            # 置 0 才给 bind/port/口令指纹——那是部署时自检用的，不该挂在公网。
+            if HEALTH_MINIMAL:
+                self._send(200, {"ok": True, "service": SERVICE_NAME, "version": SERVICE_VERSION})
+                return
             # 只给配置指纹（不可逆），用来判断"环境变量到底进没进来"，
             # 不打印明文口令。
             self._send(200, {
@@ -365,6 +461,8 @@ class Handler(BaseHTTPRequestHandler):
         self._fail(404, "NOT_FOUND", "路径不存在。")
 
     def do_POST(self):
+        if not self._rate_check():
+            return
         path = self.path.split("?")[0]
 
         if path == "/admin/reset":
@@ -383,6 +481,9 @@ class Handler(BaseHTTPRequestHandler):
                 return
             try:
                 payload = self._json_body()
+            except _BodyTooLarge as exc:
+                self._body_too_large(exc)
+                return
             except Exception:
                 self._send(400, _mcp_error(None, -32700, "parse error"))
                 return
@@ -405,6 +506,9 @@ class Handler(BaseHTTPRequestHandler):
                 return
             try:
                 body = self._json_body()
+            except _BodyTooLarge as exc:
+                self._body_too_large(exc)
+                return
             except Exception:
                 self._fail(400, "INVALID_ARGUMENT", "请求体不是合法 JSON。")
                 return
@@ -428,6 +532,9 @@ class Handler(BaseHTTPRequestHandler):
                 return
             try:
                 args = self._json_body()
+            except _BodyTooLarge as exc:
+                self._body_too_large(exc)
+                return
             except Exception:
                 self._fail(400, "INVALID_ARGUMENT", "请求体不是合法 JSON。")
                 return
@@ -457,8 +564,12 @@ def main():
         sys.stderr.write("WARN: 绑定 %s 非回环。仅限平台沙箱；本机运行请用默认值。\n" % bind)
 
     srv = ThreadingHTTPServer((bind, port), Handler)
+    srv.daemon_threads = True
     sys.stderr.write("%s %s on %s:%d (tools=%d)\n"
                      % (SERVICE_NAME, SERVICE_VERSION, bind, port, len(mock.TOOLS)))
+    sys.stderr.write("guard: body<=%d B, rate=%d/min (admin %d/min), timeout=%.0fs, health_minimal=%s\n"
+                     % (MAX_BODY_BYTES, RATE_LIMIT_PER_MIN, RATE_LIMIT_ADMIN_PER_MIN,
+                        SOCKET_TIMEOUT, HEALTH_MINIMAL))
     srv.serve_forever()
 
 
