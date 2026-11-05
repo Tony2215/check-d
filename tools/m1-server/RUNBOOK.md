@@ -57,7 +57,7 @@ BIND=0.0.0.0 CHECKD_DEMO_TOKEN=<口令> CHECKD_ADMIN_KEY=<管理口令> PYTHONUN
 |---|---|---|---|
 | GET | `/health` | 无 | 存活检查；只给配置指纹（不可逆），不给数据 |
 | GET | `/tools` | 业务口令 | 7 个工具的 schema，供 Agent 配置 |
-| POST | `/tools/<name>` | 业务口令 | 直接调用；body 是工具入参对象 |
+| POST | `/tools/<name>` | 业务口令 | 直接调用；body 是**四键请求信封**（见下） |
 | POST | `/mcp` | 业务口令 | MCP JSON-RPC（无状态），供平台挂成工具 |
 | GET | `/evidence` | 管理口令 | 工具调用记录：工具名/参数/结果/耗时 |
 | GET | `/state` | 管理口令 | 演示数据规模与写入计数 |
@@ -65,6 +65,21 @@ BIND=0.0.0.0 CHECKD_DEMO_TOKEN=<口令> CHECKD_ADMIN_KEY=<管理口令> PYTHONUN
 | POST | `/demo/confirm` | 管理口令 | **演示确认**，见下节 |
 
 鉴权头：优先 `X-Demo-Token: <口令>`，也接受 `Authorization: Bearer <口令>`。
+
+**`POST /tools/<name>` 的 body 必须是四键请求信封，不是裸的入参对象**（2026-11-05 修正，M3 独立复验指出的唯一 FAIL）：
+
+```json
+{
+  "api_version": "checkd.agent.v1",
+  "request_id": "req_0001",
+  "timezone": "Asia/Shanghai",
+  "input": { }
+}
+```
+
+工具自己的参数全部放在 `input` 里。漏了信封会直接 400 `INVALID_ARGUMENT`。
+`api_version` 的合法值只有 `checkd.agent.v1` 一个（写成 `1.0` 会报 `unsupported`）。
+`GET /tools` 返回的 schema 是按这个形状写的，照 schema 填不会错。
 
 **为什么优先 X-Demo-Token**：实测平台反代会注入/覆盖 `Authorization`，
 只认这个头会永远 401。两个来源都收，逐个比对。
