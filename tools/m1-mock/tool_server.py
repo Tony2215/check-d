@@ -411,6 +411,55 @@ def deadline_key(t):
     return (2, "", t["task_id"])
 
 
+# date_only 截止时刻的口径。
+# 来源：M0 2026-11-05 17:04:01Z 派工单 P1-2「建议定义为截止日期当天 23:59:59」。
+# 已按该建议实现，且只在这里定义一次；若 M0 裁定不同，改这一处，
+# 生成器与校验器同时生效（P0-1 要求两边判定一致）。
+DATE_ONLY_DEADLINE_HMS = (23, 59, 59)
+
+
+def deadline_instant(t):
+    """把任务的 deadline 归一成可比较的时刻；没有截止返回 None。
+
+    这是生成器与校验器共用的唯一入口。此前两边各写一套：生成侧只认 exact，
+    校验侧按字符串比日期，于是「已逾期的任务仍能被排进未来」且两边判定不一致。
+    任何地方都不许再绕开本函数直接比 deadline。
+    """
+    dl = t.get("deadline") or {}
+    kind = dl.get("kind")
+    if kind == "exact" and dl.get("at"):
+        return parse_instant(dl["at"], "deadline.at")
+    if kind == "date_only" and dl.get("date"):
+        d = date.fromisoformat(dl["date"])
+        h, mi, s = DATE_ONLY_DEADLINE_HMS
+        return datetime(d.year, d.month, d.day, h, mi, s, tzinfo=TZ)
+    return None
+
+
+def is_overdue(t, ref=None):
+    inst = deadline_instant(t)
+    return inst is not None and inst < (ref or now())
+
+
+def unplanned_item(task_id, task_kind, code, message, basis, actions, remaining):
+    """未安排任务的统一结构。
+
+    M0 2026-11-05 17:04:01Z 派工单 P0-1/P1-3 要求每项给出 reason_code、
+    reason_message、判定依据、suggested_actions。message 保留是为了不破坏
+    M3 已验过的旧读法（她的探针读 message），两个字段值相同。
+    """
+    return {
+        "task_id": task_id,
+        "task_kind": task_kind,
+        "reason_code": code,
+        "reason_message": message,
+        "message": message,
+        "basis": basis,
+        "suggested_actions": actions,
+        "remaining_minutes": remaining,
+    }
+
+
 def schedule(payload, prefs):
     start = date.fromisoformat(payload["range"][0])
     end = date.fromisoformat(payload["range"][1])
@@ -429,21 +478,48 @@ def schedule(payload, prefs):
             (_hm(parse_instant(e["start_at"], "x")), _hm(parse_instant(e["end_at"], "x")))
             for e in fixed if e["date"] == d.isoformat())
 
-    ones = [t for t in payload["tasks"] if t["kind"] == "one_time" and t["status"] == "active"]
-    recurring = [t for t in payload["tasks"] if t["kind"] == "recurring" and t["status"] == "active"]
+    # 逾期任务在进入排程循环前就被摘出来。此前是「先尝试排、排不上才判逾期」，
+    # 于是只要日程还有空档，一个上周就该交的任务会被排到明天 —— 而这些 blocks
+    # 是可审批的。M0 2026-11-05 17:04:01Z 派工单 P0-1/P0-2 就指这条。
+    ref_now = now()
+    ones, recurring = [], []
+    for t in payload["tasks"]:
+        if t["status"] != "active":
+            continue
+        inst = deadline_instant(t)
+        if inst is not None and inst < ref_now:
+            unplanned.append(unplanned_item(
+                t["task_id"], t["kind"], "UNSCHEDULABLE_OVERDUE",
+                "该任务截止时间已过（%s），不再排入任何未来时段。" % iso(inst),
+                {"rule": "deadline < now 时禁止进入 blocks",
+                 "deadline_kind": (t.get("deadline") or {}).get("kind"),
+                 "deadline_at": iso(inst), "now": iso(ref_now)},
+                ["修改截止时间后重新生成", "若已完成请标记完成，不要排期"],
+                max(int((t.get("duration_target_seconds") or 0) // 60), 1)))
+            continue
+        (ones if t["kind"] == "one_time" else recurring).append(t)
 
     for t in sorted(ones, key=deadline_key):
         need = int(t.get("duration_target_seconds") or 0)
         placed = False
+        too_close = False          # 有空档，但最晚的合法起点已在截止之后
+        dl_inst = deadline_instant(t)
         for d in iter_dates(start, end):
             busy = day_busy[d]
             cursor = day_start
             for bs, be in busy + [(day_end, day_end)]:
                 while cursor + min_block <= bs:
                     if (bs - cursor) * 60 >= need:
+                        cand_end = _at_local(d, cursor + need // 60)
+                        if dl_inst is not None and cand_end > dl_inst:
+                            # 生成器与校验器必须用同一套截止判定（P0-1）。
+                            # 这里判块的**结束**时刻，不是开始时刻：块跨过截止
+                            # 也算越界，否则校验侧会与生成侧结论相反。
+                            too_close = True
+                            break
                         b = {"block_id": _next_id("b"), "task_id": t["task_id"], "task_kind": "one_time",
                              "start_at": iso(_at_local(d, cursor)),
-                             "end_at": iso(_at_local(d, cursor + need // 60)),
+                             "end_at": iso(cand_end),
                              "source": "proposal", "persistable_as": "one_time_schedule",
                              "duration_source": "task_target", "duration_seconds": need}
                         blocks.append(b)
@@ -455,19 +531,30 @@ def schedule(payload, prefs):
                         placed = True
                         break
                     cursor += 30
-                if placed:
+                if placed or too_close:
                     break
                 cursor = max(cursor, be)
-            if placed:
+            if placed or too_close:
                 break
         if not placed:
-            dl = t.get("deadline") or {}
-            past = dl.get("kind") == "exact" and dl.get("at") and \
-                parse_instant(dl["at"], "deadline") < now()
-            reason = "PAST_DEADLINE" if past else ("OVERLAPS_FIXED" if fixed else "NO_AVAILABILITY")
-            unplanned.append({"task_id": t["task_id"], "reason_code": reason,
-                              "remaining_minutes": max(int(need // 60), 1),
-                              "message": "未找到可容纳目标时长的空档。"})
+            if too_close:
+                reason = "INSUFFICIENT_TIME_BEFORE_DEADLINE"
+                msg = "截止前剩余窗口不足以容纳目标时长 %d 分钟。" % (need // 60)
+                basis = {"rule": "块结束时刻不得晚于 deadline",
+                         "deadline_kind": (t.get("deadline") or {}).get("kind"),
+                         "deadline_at": iso(dl_inst) if dl_inst else None,
+                         "required_minutes": need // 60}
+                acts = ["缩短本次时长", "推迟截止时间", "拆成多个较短时段"]
+            else:
+                reason = "OVERLAPS_FIXED" if fixed else "NO_AVAILABILITY"
+                msg = "未找到可容纳目标时长的空档。"
+                basis = {"rule": "可用窗口内无连续空档",
+                         "required_minutes": need // 60,
+                         "has_fixed_events": bool(fixed)}
+                acts = ["放宽每日起止时间", "缩短目标时长"]
+            unplanned.append(unplanned_item(
+                t["task_id"], "one_time", reason, msg, basis, acts,
+                max(int(need // 60), 1)))
 
     for t in recurring:
         target = t.get("duration_target_seconds")
@@ -502,9 +589,14 @@ def schedule(payload, prefs):
                 cursor = max(cursor, be)
             if not placed:
                 reason = "WINDOW_INSUFFICIENT" if (day_end - day_start) < minutes else "NO_AVAILABILITY"
-                unplanned.append({"task_id": t["task_id"], "reason_code": reason,
-                                  "remaining_minutes": minutes,
-                                  "message": "当日可用窗口不足以容纳该周期任务。"})
+                unplanned.append(unplanned_item(
+                    t["task_id"], "recurring", reason,
+                    "当日可用窗口不足以容纳该周期任务。",
+                    {"rule": "单日可用窗口内无连续空档",
+                     "day_window_minutes": day_end - day_start,
+                     "required_minutes": minutes,
+                     "local_date": d.isoformat()},
+                    ["放宽每日起止时间", "缩短该任务时长"], minutes))
     return blocks, changes, unplanned, already_done
 
 
@@ -544,6 +636,25 @@ def check_hard_constraints(proposal, events):
                             % (iso(bs), iso(be), iso(es), iso(ee)),
                     related_block_ids=[b["block_id"]],
                     related_event_ids=[e["event_id"]]))
+        # 截止时间越界（M0 2026-11-05 17:04:01Z 派工单 P0-1/P0-2）。
+        # 与生成器共用 deadline_instant，判的是块的**结束**时刻。
+        # 复用契约内已有的两个 violation code，不新增闭集外的码：
+        # 逾期任务的块必然满足「块结束 > 截止」，所以同一判据能覆盖两种情形。
+        bt = STATE["tasks"].get(b.get("task_id")) or {}
+        dl_inst = deadline_instant(bt)
+        if dl_inst is not None and be > dl_inst:
+            dl_kind = (bt.get("deadline") or {}).get("kind")
+            code = ("BLOCK_AFTER_EXACT_DEADLINE" if dl_kind == "exact"
+                    else "BLOCK_AFTER_DATE_ONLY_DEADLINE")
+            overdue = dl_inst < now()
+            msg = ("该任务截止时间已过（%s），提案仍为其生成时间块 %s 至 %s。"
+                   % (iso(dl_inst), iso(bs), iso(be)) if overdue
+                   else "提案时间块结束于 %s，晚于该任务截止时刻 %s。"
+                        % (iso(be), iso(dl_inst)))
+            violations.append(dict(
+                code=code, message=msg,
+                related_block_ids=[b["block_id"]],
+                related_task_ids=[b["task_id"]]))
     # 块间重叠：M0 2026-11-03 裁定 A，契约 §5.8 新增公开 violation code
     # BLOCK_OVERLAP。属"结构合法但违反调度硬约束"，走 normal invalid 响应，
     # 不作为 PROPOSAL_INVALID 结构错误抛出。
