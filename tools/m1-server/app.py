@@ -79,6 +79,17 @@ ENGINE_PORT = int(os.environ.get("M2_ENGINE_PORT", "8787"))
 ENGINE_ENTRY = os.environ.get("CHECKD_ENGINE_ENTRY", "tools/m2-engine/bin/serve.dart")
 _ENGINE = {"pid": None, "error": None}
 
+# 工具层是否真的把 generate/validate 转发给 M2 引擎。
+#
+# 与 ENGINE_ENABLED 是两件事，必须分开：
+#   ENGINE_ENABLED=1 只表示「引擎进程被拉起来了」（/diag 的 engine.up 看这个）
+#   ENGINE_WIRED=1   才表示「工具调用真的打到引擎」（/health 的 scheduler_mode 看这个）
+#
+# 2026-11-06 现状：ENGINE_ENABLED=1 但 ENGINE_WIRED=0 —— 引擎活着、工具层仍走 mock。
+# 这正是 M0 14:16:20Z 放行令第 4 条要禁止的「静默回退」形态：引擎明明在，
+# 调用却不经过它，而外部看不出来。所以这个标识必须对外可见，且不许写死成 REAL。
+ENGINE_WIRED = os.environ.get("CHECKD_ENGINE_WIRED", "0") == "1"
+
 _RATE = {}              # (ip, bucket) -> deque[monotonic ts]
 _RATE_LOCK = threading.Lock()
 
@@ -501,7 +512,9 @@ class Handler(BaseHTTPRequestHandler):
             # CHECKD_HEALTH_MINIMAL=1（公网默认）只回三样：活着、叫什么、什么版本。
             # 置 0 才给 bind/port/口令指纹——那是部署时自检用的，不该挂在公网。
             if HEALTH_MINIMAL:
-                self._send(200, {"ok": True, "service": SERVICE_NAME, "version": SERVICE_VERSION})
+                self._send(200, {"ok": True, "service": SERVICE_NAME,
+                                 "version": SERVICE_VERSION,
+                                 "scheduler_mode": _scheduler_mode()})
                 return
             # 只给配置指纹（不可逆），用来判断"环境变量到底进没进来"，
             # 不打印明文口令。
@@ -521,6 +534,10 @@ class Handler(BaseHTTPRequestHandler):
                 "starts_at": _STATS["starts_at"],
                 "calls": _STATS["calls"],
                 "errors": _STATS["errors"],
+                # M0 14:16:20Z 放行令第 4 条：保留可识别的 REAL/MOCK 状态。
+                # 当前恒为 MOCK（工具层未接线），引擎进程存活另见 /diag 的 engine.up。
+                "scheduler_mode": _scheduler_mode(),
+                "engine_enabled": ENGINE_ENABLED,
             })
             return
 
@@ -655,12 +672,31 @@ class Handler(BaseHTTPRequestHandler):
         self._fail(405, "INVALID_ARGUMENT", "不支持的方法。")
 
 
+def _scheduler_mode():
+    """工具层实际走哪条路。**不探测引擎**，纯静态判定，保证 /health 不因回环探测变慢。
+
+    MOCK              ：工具调用走 tools/m1-mock/tool_server.py（当前状态）
+    REAL              ：工具调用已转发 M2 引擎（ENGINE_WIRED=1 且引擎已启用）
+    MOCK_ENGINE_WIRED ：接线开关打开但引擎没启用——配置自相矛盾，必须显式暴露
+
+    注意：REAL 只表示「转发已启用」，不表示引擎此刻可用。引擎存活看 /diag 的 engine.up。
+    两件事分开报，免得把「进程在」误读成「链路通」。
+    """
+    if not ENGINE_WIRED:
+        return "MOCK"
+    if not ENGINE_ENABLED:
+        return "MOCK_ENGINE_WIRED"
+    return "REAL"
+
+
 def _engine_status():
     """查容器内的 M2 引擎是否活着。只读，只走回环。"""
     import urllib.request
     st = {"enabled": ENGINE_ENABLED, "port": ENGINE_PORT,
           "entry": ENGINE_ENTRY, "entry_exists": os.path.exists(ENGINE_ENTRY),
-          "pid": _ENGINE.get("pid"), "spawn_error": _ENGINE.get("error")}
+          "pid": _ENGINE.get("pid"), "spawn_error": _ENGINE.get("error"),
+          # 接线状态与进程状态分开报：前者是配置事实，后者要探测。
+          "wired": ENGINE_WIRED, "scheduler_mode": _scheduler_mode()}
     if not ENGINE_ENABLED:
         return st
     try:
