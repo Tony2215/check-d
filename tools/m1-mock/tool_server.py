@@ -499,6 +499,13 @@ def schedule(payload, prefs):
             continue
         (ones if t["kind"] == "one_time" else recurring).append(t)
 
+    # 今天这一刻：候选起点不得早于现在。
+    # M3 2026-11-06 03:46:27Z 实测发现：now=11:44 时把 4 小时任务排成 08:00-12:00，
+    # 块起点落在过去。起点按 5 分钟向上取整。
+    _now_local = now().astimezone(TZ)
+    today = _now_local.date()
+    today_floor = ((_now_local.hour * 60 + _now_local.minute + 4) // 5) * 5
+
     for t in sorted(ones, key=deadline_key):
         need = int(t.get("duration_target_seconds") or 0)
         placed = False
@@ -506,7 +513,7 @@ def schedule(payload, prefs):
         dl_inst = deadline_instant(t)
         for d in iter_dates(start, end):
             busy = day_busy[d]
-            cursor = day_start
+            cursor = max(day_start, today_floor) if d == today else day_start
             for bs, be in busy + [(day_end, day_end)]:
                 while cursor + min_block <= bs:
                     if (bs - cursor) * 60 >= need:
@@ -568,10 +575,17 @@ def schedule(payload, prefs):
                     already_done.append(t["task_id"])
                 continue
             busy = day_busy[d]
-            cursor = day_start
+            cursor = max(day_start, today_floor) if d == today else day_start
             placed = False
             for bs, be in busy + [(day_end, day_end)]:
                 if not placed and bs - cursor >= minutes:
+                    # action 语义：当天已有该任务的落点（已有 override，或该
+                    # 周期任务本来就有固定时刻）才算「改期 reschedule」；
+                    # 首次指派是 assign。M3 2026-11-06 03:46:27Z 抓到的 c5
+                    # 同源缺陷：旧实现把首次指派也写死成 reschedule。
+                    already = (STATE["overrides"].get((t["task_id"], d.isoformat())) is not None
+                               or ((t.get("recurrence") or {}).get("scheduled_minute_of_day") is not None))
+                    action = "reschedule" if already else "assign"
                     blocks.append({"block_id": _next_id("b"), "task_id": t["task_id"], "task_kind": "recurring",
                                    "start_at": iso(_at_local(d, cursor)),
                                    "end_at": iso(_at_local(d, cursor + minutes)),
@@ -580,7 +594,7 @@ def schedule(payload, prefs):
                                    "duration_seconds": minutes * 60})
                     changes.append({"change_id": _next_id("ch"), "type": "upsert_daily_override",
                                     "item_type": "recurring", "item_id": t["task_id"],
-                                    "local_date": d.isoformat(), "action": "reschedule",
+                                    "local_date": d.isoformat(), "action": action,
                                     "planned_start_minute": cursor,
                                     "planned_end_minute": cursor + minutes})
                     busy.append((cursor, cursor + minutes))
@@ -1190,6 +1204,13 @@ def tool_apply(args, user):
             }
             record_write()
             applied.append({"change_id": ch["change_id"], "type": ch["type"],
+                            # task_id / planned_date / scheduled_at 三个键统一给，
+                            # 不因分支不同而缺。M3 2026-11-06 03:46:27Z 报的
+                            # 「applied_changes 形状静默变更」就是这条分支缺键，
+                            # 导致 S1/S2 的 readback 拿不到 planned_date。
+                            "task_id": ch["item_id"],
+                            "planned_date": ch["local_date"],
+                            "scheduled_at": None,
                             "item_type": ch["item_type"], "item_id": ch["item_id"],
                             "local_date": ch["local_date"], "action": ch["action"],
                             "planned_start_minute": ch["planned_start_minute"],
