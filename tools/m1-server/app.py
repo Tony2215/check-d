@@ -71,6 +71,14 @@ RATE_LIMIT_ADMIN_PER_MIN = int(os.environ.get("CHECKD_RATE_ADMIN_PER_MIN", "60")
 SOCKET_TIMEOUT = float(os.environ.get("CHECKD_SOCKET_TIMEOUT", "15"))
 HEALTH_MINIMAL = os.environ.get("CHECKD_HEALTH_MINIMAL", "1") == "1"
 
+# M2 引擎（可选）：CHECKD_ENGINE=1 时在容器内回环上拉起 Dart 引擎。
+# 默认关，保证「引擎跑不起来也不影响已有链路」；开的时候 /diag 会如实报状态，
+# 绝不在引擎不可用时假装成功。
+ENGINE_ENABLED = os.environ.get("CHECKD_ENGINE", "0") == "1"
+ENGINE_PORT = int(os.environ.get("M2_ENGINE_PORT", "8787"))
+ENGINE_ENTRY = os.environ.get("CHECKD_ENGINE_ENTRY", "tools/m2-engine/bin/serve.dart")
+_ENGINE = {"pid": None, "error": None}
+
 _RATE = {}              # (ip, bucket) -> deque[monotonic ts]
 _RATE_LOCK = threading.Lock()
 
@@ -142,6 +150,19 @@ def _env_diag():
     # 1) 有没有可用的子进程运行时：先看可执行文件在不在，再真跑一次。
     binaries = ("dart", "flutter", "node", "git", "bash", "sh", "curl", "java")
     diag["binaries"] = {b: shutil.which(b) for b in binaries}
+    # 关键版本号：Dart 3 的语法（switch 表达式等）在 Dart 2 上编不过，
+    # 这是「引擎能不能在本容器跑」的第一判据，必须报出来。
+    versions = {}
+    for b in ("dart", "flutter"):
+        if not diag["binaries"].get(b):
+            continue
+        for args in ((b, "--version"),):
+            try:
+                pv = subprocess.run(list(args), capture_output=True, text=True, timeout=25)
+                versions[b] = ((pv.stdout or "") + (pv.stderr or "")).strip().splitlines()[:2]
+            except Exception as e:                           # noqa: BLE001
+                versions[b] = [type(e).__name__]
+    diag["versions"] = versions
     spawn = {"ok": False}
     try:
         p = subprocess.run([sys.executable, "-c", "print('spawn-ok')"],
@@ -190,6 +211,8 @@ def _env_diag():
     # 5) 只报环境变量名，不报值。
     diag["env_keys"] = sorted(k for k in os.environ
                               if k.startswith("CHECKD_") or k in ("BIND", "PORT", "PATH"))
+    # 6) M2 引擎存活状态（只走回环）。
+    diag["engine"] = _engine_status()
     return diag
 
 
@@ -632,6 +655,61 @@ class Handler(BaseHTTPRequestHandler):
         self._fail(405, "INVALID_ARGUMENT", "不支持的方法。")
 
 
+def _engine_status():
+    """查容器内的 M2 引擎是否活着。只读，只走回环。"""
+    import urllib.request
+    st = {"enabled": ENGINE_ENABLED, "port": ENGINE_PORT,
+          "entry": ENGINE_ENTRY, "entry_exists": os.path.exists(ENGINE_ENTRY),
+          "pid": _ENGINE.get("pid"), "spawn_error": _ENGINE.get("error")}
+    if not ENGINE_ENABLED:
+        return st
+    try:
+        with urllib.request.urlopen("http://127.0.0.1:%d/health" % ENGINE_PORT,
+                                    timeout=5) as r:
+            st["health"] = json.loads(r.read().decode("utf-8"))
+            st["up"] = True
+    except Exception as e:                                   # noqa: BLE001
+        st["up"] = False
+        st["health_error"] = type(e).__name__
+    # 引擎日志尾部：起不来时唯一能定位原因的东西。只回最后 12 行。
+    try:
+        with open(os.path.join(os.getcwd(), "engine.log"), "rb") as f:
+            lines = f.read().decode("utf-8", "replace").splitlines()[-12:]
+        st["log_tail"] = lines
+    except Exception:                                        # noqa: BLE001
+        st["log_tail"] = []
+    return st
+
+
+def _start_engine():
+    """把 M2 的 Dart 引擎拉到容器内回环上跑。失败不致命，但会被 /diag 如实暴露。
+
+    只用相对路径 `dart run tools/m2-engine/bin/serve.dart`：M2 2026-11-05
+    17:33:55Z 已确认这套包相对导入、不要 pubspec、不要 pub get。
+    """
+    import subprocess
+    if not ENGINE_ENABLED:
+        return
+    if not os.path.exists(ENGINE_ENTRY):
+        _ENGINE["error"] = "entry_missing"
+        return
+    env = dict(os.environ)
+    env["M2_ENGINE_PORT"] = str(ENGINE_PORT)
+    env.setdefault("M2_ENGINE_HOST", "127.0.0.1")
+    try:
+        log = open(os.path.join(os.getcwd(), "engine.log"), "ab")
+        # 直接执行，不用 `dart run`：容器里没有 pubspec，`dart run` 会去找
+        # package config 而失败；脚本本身只有相对导入，直接跑即可。
+        p = subprocess.Popen(["dart", ENGINE_ENTRY], env=env,
+                             stdout=log, stderr=log, cwd=os.getcwd())
+        _ENGINE["pid"] = p.pid
+        sys.stderr.write("engine: spawned pid=%d port=%d entry=%s\n"
+                         % (p.pid, ENGINE_PORT, ENGINE_ENTRY))
+    except Exception as e:                                   # noqa: BLE001
+        _ENGINE["error"] = "%s: %s" % (type(e).__name__, e)
+        sys.stderr.write("engine: spawn failed %s\n" % _ENGINE["error"])
+
+
 def main():
     bind = os.environ.get("BIND", "127.0.0.1")
     port = int(os.environ.get("PORT", "8790"))
@@ -644,6 +722,7 @@ def main():
     if bind not in ("127.0.0.1", "localhost", "::1"):
         sys.stderr.write("WARN: 绑定 %s 非回环。仅限平台沙箱；本机运行请用默认值。\n" % bind)
 
+    _start_engine()
     srv = ThreadingHTTPServer((bind, port), Handler)
     srv.daemon_threads = True
     sys.stderr.write("%s %s on %s:%d (tools=%d)\n"
