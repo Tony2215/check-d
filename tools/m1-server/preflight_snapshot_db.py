@@ -24,6 +24,8 @@
    被拒即抛 ReadOnlyViolation，不会执行。
 3. **实测自证**：连接后真的去 `create temp table` 一次，**必须被数据库拒绝**
    （SQLSTATE 25006 read_only_sql_transaction）。能建成功 = 只读没生效 → BLOCKED。
+   只认 25006：其它异常（无 sqlstate、42501 权限错、连接断开）一律记 FAIL，
+   因为它们证明不了只读生效，只能证明「这次写没成功」。
 
 对应 2026-11-07 M0 阻断件：旧版第 3–7 节行为测试无条件执行 INSERT/DELETE，
 默认命令并非只读，邮件描述与代码不一致。本版把写操作全部移入
@@ -212,6 +214,19 @@ def _rollback_quiet(conn):
         pass
 
 
+def _rejection_proves_read_only(exc):
+    """探针被拒这件事，够不够证明「只读真的生效」。
+
+    P2（M2 2026-11-07 / M3 2026-11-07 附议）：只认 SQLSTATE **25006**
+    （read_only_sql_transaction）。旧判据把「sqlstate 为空」和「消息里含
+    read-only」也算通过——断连、代理改写、权限错（42501）都会落进来，于是把
+    「未发现只读未生效」冒充成「证明只读生效」。这里一律 fail-closed：
+    拿不到 25006 就记 FAIL，宁可给 M0 一条明确的失败，也不给一条虚的 PASS。
+    """
+    st = getattr(getattr(exc, "diag", None), "sqlstate", None)
+    return st == "25006"
+
+
 def prove_read_only(conn):
     """实测自证：只读事务里建临时表必须被数据库拒绝。
 
@@ -226,10 +241,11 @@ def prove_read_only(conn):
         conn.execute("create temp table _checkd_ro_probe(x int)")
     except Exception as e:                                   # noqa: BLE001
         st = getattr(getattr(e, "diag", None), "sqlstate", None)
-        ok = st in (None, "25006") or "read-only" in str(e).lower() or "只读" in str(e)
+        ok = _rejection_proves_read_only(e)
         _rollback_quiet(conn)
         rec("写入实测被拒（只读真的生效）", ok,
-            "sqlstate=%s %s" % (st, type(e).__name__))
+            "sqlstate=%s %s%s" % (st, type(e).__name__,
+                                  "" if ok else "（非 25006，不能证明只读生效）"))
         return ok
     # 不该走到这里：探针建表成功 = 只读未生效。只回滚，不做清理写（N3）。
     _rollback_quiet(conn)

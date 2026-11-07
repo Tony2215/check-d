@@ -278,5 +278,49 @@ class TestProcessBehaviour(unittest.TestCase):
         self.assertTrue("not allowed" in low or "mutually exclusive" in low, low)
 
 
+class _Diag(object):
+    def __init__(self, sqlstate):
+        self.sqlstate = sqlstate
+
+
+class _FakeError(Exception):
+    """够像 psycopg 异常的假件：只带 diag.sqlstate 和消息。"""
+
+    def __init__(self, sqlstate=None, msg="boom"):
+        Exception.__init__(self, msg)
+        self.diag = _Diag(sqlstate)
+
+
+class TestReadOnlyProof(unittest.TestCase):
+    """P2（M2 2026-11-07 提出 / M3 同日附议）：只有 25006 算证据。
+
+    旧判据 `st in (None, "25006") or "read-only" in msg` 会把断连、代理改写、
+    权限错（42501）都记成「只读已生效」，等于用「未发现只读未生效」冒充
+    「证明只读生效」。这里逐条钉住 fail-closed 行为。
+    """
+
+    def test_25006_is_proof(self):
+        self.assertTrue(pf._rejection_proves_read_only(_FakeError("25006")))
+
+    def test_no_sqlstate_is_not_proof(self):
+        self.assertFalse(pf._rejection_proves_read_only(_FakeError(None)))
+        self.assertFalse(pf._rejection_proves_read_only(
+            Exception("server closed the connection unexpectedly")))
+
+    def test_other_sqlstate_is_not_proof(self):
+        self.assertFalse(pf._rejection_proves_read_only(_FakeError("42501")))
+
+    def test_read_only_wording_alone_is_not_proof(self):
+        """消息里带 read-only 但没 sqlstate —— 可能是代理改写，不算证据。"""
+        self.assertFalse(pf._rejection_proves_read_only(
+            _FakeError(None, "cannot execute CREATE TABLE in a read-only transaction")))
+        self.assertFalse(pf._rejection_proves_read_only(
+            _FakeError(None, "当前事务是只读的")))
+
+    def test_source_has_no_permissive_fallback(self):
+        src = open(SRC_FILE, encoding="utf-8").read()
+        self.assertNotIn('st in (None, "25006")', src, "旧的宽松判据还在，P2 未修")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
