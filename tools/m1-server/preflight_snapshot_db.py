@@ -29,6 +29,22 @@
 默认命令并非只读，邮件描述与代码不一致。本版把写操作全部移入
 `behavior_tests()`，且它只能由 `--behavior-tests --i-have-m0-approval` 进入。
 
+## 退出码
+
+| 码 | 含义 |
+|---|---|
+| 0 | 全部检查项无 FAIL |
+| 1 | 有 FAIL 项（结果文件里有明细） |
+| 2 | 拿不到库 / 缺 psycopg3 —— 不出任何 PASS |
+| 3 | REFUSED：写路径缺 `--i-have-m0-approval` |
+| 4 | BLOCKED：只读证明失败（连接非只读，或探针建表成功），后续检查一律未执行 |
+
+## 结果文件路径（固定，与 cwd 无关）
+
+1. 上溯找到 `work/m1/` → `work/m1/preflight_snapshot_db_result.json`
+2. 否则（干净 clone）→ `<仓库根>/preflight_snapshot_db_result.json`
+3. 要别的路径用 `--out`。**不再静默回退当前目录**（M0 令 N1）。
+
 ## 不做什么
 
 - 不建库、不 drop 任何东西。
@@ -138,10 +154,16 @@ def safe_dsn(dsn):
 
 
 def default_out():
-    """写 work/m1/preflight_snapshot_db_result.json（与邮件口径一致）。
+    """结果 JSON 的固定默认路径 —— **与当前工作目录无关**（M0 令 N1）。
 
-    从本文件上溯找名为 work 的目录且其下有 m1/；找不到就落到当前目录。
-    旧版写到 tools/m1-server/ 下，与邮件里说的路径不一致（M0 阻断件第 4 条）。
+    优先级 1（本机工作区布局）：上溯找到 `work/` 且其下有 `m1/`
+        → `work/m1/preflight_snapshot_db_result.json`（与邮件口径一致）。
+    优先级 2（干净 clone，如 M0 的 Mac）：脚本在 `<repo>/tools/m1-server/` 下，
+        取上两级即仓库根 → `<repo>/preflight_snapshot_db_result.json`。
+
+    旧版在两级都找不到时静默回退 `os.getcwd()`，同一个脚本在不同目录跑会写到
+    不同位置，和邮件承诺的路径不一致（M0 2026-11-07 阻断件 N1）。
+    本版不再回退 cwd；需要别的路径请显式 `--out`。
     """
     p = _HERE
     for _ in range(8):
@@ -151,7 +173,8 @@ def default_out():
         if parent == p:
             break
         p = parent
-    return os.path.join(os.getcwd(), "preflight_snapshot_db_result.json")
+    repo_root = os.path.dirname(os.path.dirname(_HERE))       # tools/m1-server → repo
+    return os.path.join(repo_root, "preflight_snapshot_db_result.json")
 
 
 # ------------------------------------------------------------------ 只读检查
@@ -175,26 +198,37 @@ def check_connection(conn):
     return str(flag).lower() in ("on", "true", "1")
 
 
+def _rollback_quiet(conn):
+    """静默回滚——只回滚事务，不发任何 SQL 语句。"""
+    try:
+        conn.rollback()
+    except Exception:                                        # noqa: BLE001
+        pass
+
+
 def prove_read_only(conn):
     """实测自证：只读事务里建临时表必须被数据库拒绝。
 
     这是本版的核心证据 —— 不是「文件名带 readonly」，是数据库真的拒绝了写。
+
+    N3（M0 2026-11-07）：探针若**意外建表成功**，说明只读没生效，此时
+    不得再执行任何「清理写」（旧版会 drop 掉探针表）；本版只回滚事务并把
+    结论记 FAIL，由调用方立即 BLOCKED 退出。
     """
     try:
-        with conn.transaction():
-            conn.execute("create temp table _checkd_ro_probe(x int)")
+        conn.execute("begin")
+        conn.execute("create temp table _checkd_ro_probe(x int)")
     except Exception as e:                                   # noqa: BLE001
         st = getattr(getattr(e, "diag", None), "sqlstate", None)
         ok = st in (None, "25006") or "read-only" in str(e).lower() or "只读" in str(e)
+        _rollback_quiet(conn)
         rec("写入实测被拒（只读真的生效）", ok,
             "sqlstate=%s %s" % (st, type(e).__name__))
         return ok
-    # 不该走到这里
-    try:
-        conn.execute("drop table if exists _checkd_ro_probe")
-    except Exception:                                        # noqa: BLE001
-        pass
-    rec("写入实测被拒（只读真的生效）", False, "临时表居然建成功了——只读未生效")
+    # 不该走到这里：探针建表成功 = 只读未生效。只回滚，不做清理写（N3）。
+    _rollback_quiet(conn)
+    rec("写入实测被拒（只读真的生效）", False,
+        "临时表居然建成功了——只读未生效（已回滚事务，未执行清理写）")
     return False
 
 
@@ -408,6 +442,9 @@ def main():
         print("         获批后加 --i-have-m0-approval 再跑；只读探测请去掉该参数。")
         return 3
 
+    # 固定结果路径（M0 令 N1）：与 cwd 无关，先算好并打印，跑完就知道去哪找。
+    out = args.out or default_out()
+
     dsn = os.environ.get("CHECKD_DEMO_DSN") or os.environ.get("DATABASE_URL")
     if not dsn:
         print("BLOCKED: 未提供 CHECKD_DEMO_DSN。没有库就不出任何 PASS。")
@@ -426,6 +463,7 @@ def main():
                                                  info.get("user", "")))
     print("模式: %s" % ("APPLY(写)" if args.apply else
                        "BEHAVIOR-TESTS(写)" if args.behavior_tests else "READ-ONLY"))
+    print("结果文件: %s" % os.path.abspath(out))
 
     # 只读模式：连接建立时就把 default_transaction_read_only 打开。
     # 放在 options 里而不是连上后 SET —— 少一个「先写后读」的窗口。
@@ -443,6 +481,7 @@ def main():
         return 2
 
     ro_proof = {}
+    blocked = None
     try:
         with conn:
             conn.autocommit = True
@@ -455,22 +494,32 @@ def main():
                 rec("只读自证（写模式跳过）", True, "写模式不做只读断言", skipped=True)
                 ro_proof = {"applicable": False}
             elif not ro_on:
-                rec("只读自证", False, "连接未处于只读，停止后续检查")
+                # N2（M0 2026-11-07）：旧版只记一句「停止后续检查」却继续往下跑。
+                # 本版真的停：不执行 check_schema / check_privileges，直接 BLOCKED。
+                rec("只读自证", False,
+                    "连接未处于只读 → 立即 BLOCKED，schema/权限检查不执行")
                 ro_proof = {"applicable": True, "conn_setting": "off"}
+                blocked = "连接层只读未生效（default_transaction_read_only 非 on）"
             else:
                 proved = prove_read_only(conn)
                 ro_proof = {"applicable": True, "conn_setting": "on",
                             "write_probe_refused": bool(proved)}
+                if not proved:
+                    blocked = "只读写入探针未被拒绝（临时表建成功）"
 
-            check_schema(conn)
-            check_privileges(conn)
-
-            if args.behavior_tests:
-                behavior_tests(conn)
+            if blocked:
+                rec("只读阻断", False,
+                    "BLOCKED：%s；后续 schema/权限/行为检查一律未执行" % blocked)
             else:
-                rec("写入型行为测试（唯一索引/FK/TTL 实拍）", True,
-                    "未执行：需 --behavior-tests --i-have-m0-approval（默认跳过）",
-                    skipped=True)
+                check_schema(conn)
+                check_privileges(conn)
+
+                if args.behavior_tests:
+                    behavior_tests(conn)
+                else:
+                    rec("写入型行为测试（唯一索引/FK/TTL 实拍）", True,
+                        "未执行：需 --behavior-tests --i-have-m0-approval（默认跳过）",
+                        skipped=True)
 
     finally:
         try:
@@ -485,7 +534,6 @@ def main():
     print("\n合计 PASS %d / FAIL %d / SKIP %d（共 %d 项）"
           % (passed, failed, skipped, len(RESULTS)))
 
-    out = args.out or default_out()
     try:
         os.makedirs(os.path.dirname(out), exist_ok=True)
     except Exception:                                        # noqa: BLE001
@@ -494,9 +542,11 @@ def main():
         "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "mode": "apply" if args.apply else
                 "behavior-tests" if args.behavior_tests else "read-only",
+        "out_path": os.path.abspath(out),
         "target": info,
         "read_only_proof": ro_proof,
         "write_statements_allowed": bool(writes),
+        "blocked": blocked,
         "passed": passed, "failed": failed, "skipped": skipped, "total": len(RESULTS),
         "results": RESULTS,
     }
@@ -505,6 +555,11 @@ def main():
         f.write("\n")
     print("结果已写入 %s" % os.path.abspath(out))
 
+    # 只读证明失败 = 立即 BLOCKED 退出（M0 令 N2），不与「有 FAIL 项」混用同一个码。
+    if blocked:
+        print("BLOCKED: %s" % blocked)
+        print("         后续 schema / 权限 / 行为检查未执行；本文件不含它们的结论。")
+        return 4
     if failed:
         return 1
     return 0

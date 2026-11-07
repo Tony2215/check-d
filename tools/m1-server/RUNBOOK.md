@@ -158,3 +158,19 @@ python tools/m1-server/preflight_snapshot_db.py --apply          --i-have-m0-app
 
 缺 `--i-have-m0-approval` 一律 `REFUSED` + exit 3。**不要**用「文件名/参数名看起来是只读」
 当证据 —— 2026-11-07 就出过一版默认路径会 INSERT/DELETE 的脚本，注释写着只读。
+
+### 9.1 唯一命令（macOS / Linux，M0 本机）
+
+```bash
+cd <仓库根> && CHECKD_DEMO_DSN="$CHECKD_DEMO_DSN" \
+  python3 tools/m1-server/preflight_snapshot_db.py
+```
+
+- 结果路径**固定且与 cwd 无关**：先找 `<仓库>/../work/m1/`（本机工作区布局），
+  干净 clone 下落到 `<仓库根>/preflight_snapshot_db_result.json`；脚本开头会打印
+  `结果文件: <绝对路径>`，跑完照它取文件。要别的路径加 `--out /abs/path.json`。
+- 退出码：`0` 无 FAIL／`1` 有 FAIL／`2` 拿不到库或缺 psycopg3／
+  `3` REFUSED（写路径缺授权）／`4` BLOCKED（只读证明失败，后续检查一律未执行）。
+- 只读证明失败（连接非只读，或探针临时表居然建成功）**立即 exit 4**，
+  不再跑 schema/权限检查，也不会去「清理」探针表（只回滚事务）。
+

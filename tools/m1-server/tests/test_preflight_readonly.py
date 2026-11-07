@@ -26,6 +26,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -156,6 +157,39 @@ class TestOutputPath(unittest.TestCase):
         out = pf.default_out().replace("\\", "/")
         self.assertTrue(out.endswith("m1/preflight_snapshot_db_result.json"), out)
         self.assertIn("/work/m1/", out, out)
+
+    def test_default_out_independent_of_cwd(self):
+        """N1（M0 2026-11-07）：结果路径不得随 cwd 变。
+
+        旧版找不到 work/m1 就回退 os.getcwd()，同一个脚本换个目录跑就写到别处，
+        与邮件承诺的路径不一致。这里把 cwd 换到临时目录，结果必须一模一样。
+        """
+        here = pf.default_out()
+        old = os.getcwd()
+        tmp = tempfile.mkdtemp(prefix="pf-cwd-")
+        try:
+            os.chdir(tmp)
+            self.assertEqual(pf.default_out(), here,
+                             "default_out() 跟随了 cwd，N1 未修复")
+        finally:
+            os.chdir(old)
+
+    def test_no_cleanup_write_in_probe(self):
+        """N3：只读探针失败后不得再执行任何清理写（旧版会 drop 掉探针表）。"""
+        src = open(SRC_FILE, encoding="utf-8").read()
+        fn = src[src.index("def prove_read_only"):]
+        fn = fn[:fn.index("\ndef ", 1)] if "\ndef " in fn[1:] else fn
+        self.assertNotIn("drop table", fn.lower(),
+                         "prove_read_only 里出现了清理写（N3 回归）")
+
+    def test_blocked_path_skips_schema_checks(self):
+        """N2：只读证明失败要真的停，不是只记一行日志。"""
+        src = open(SRC_FILE, encoding="utf-8").read()
+        self.assertIn("if blocked:", src, "缺少 blocked 分支，N2 未修复")
+        blocked_at = src.index("if blocked:")
+        self.assertLess(blocked_at, src.rindex("check_schema(conn)"),
+                        "check_schema 必须在 blocked 分支之后（即被跳过）")
+        self.assertIn("return 4", src, "只读阻断必须用独立退出码 4")
 
 
 class TestProcessBehaviour(unittest.TestCase):

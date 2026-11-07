@@ -619,10 +619,11 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(raw)
 
-    def _fail(self, status, code, message, request_id=None):
+    def _fail(self, status, code, message, request_id=None, details=None):
         trace = uuid.uuid4().hex[:16]
         if errs.is_known_code(code):
-            body = errs.to_envelope(code, message, request_id=request_id, trace_id=trace)
+            body = errs.to_envelope(code, message, request_id=request_id,
+                                    trace_id=trace, details=details)
         else:
             body = {"api_version": "checkd.agent.v1", "request_id": request_id,
                     "trace_id": trace, "status": "error",
@@ -698,13 +699,23 @@ class Handler(BaseHTTPRequestHandler):
             self._fail(503, "DEPENDENCY_UNAVAILABLE",
                        "服务未配置访问口令，已按失败即关闭处理。")
             return False
+        cands = self._candidates()
+        # N6（M0 2026-11-07 令 D）：区分「完全没带凭证」与「凭证无效」。
+        # 错误码仍是闭集内的 APPROVAL_UNTRUSTED，不新增码；可区分性靠 message +
+        # details.reason，客户端可以按字段判定，不必解析中文文案。
+        if not cands:
+            self._fail(401, "APPROVAL_UNTRUSTED",
+                       "缺少访问凭证：请在 X-Demo-Token 请求头提供。",
+                       details=[{"field": "X-Demo-Token", "reason": "missing"}])
+            return False
         # 常量时间比对：逐个候选走 compare_digest，不用 in / == 提前返回。
         ok = False
-        for cand in self._candidates():
+        for cand in cands:
             if hmac.compare_digest(cand, DEMO_TOKEN):
                 ok = True
         if not ok:
-            self._fail(401, "APPROVAL_UNTRUSTED", "凭证无效。")
+            self._fail(401, "APPROVAL_UNTRUSTED", "凭证无效。",
+                       details=[{"field": "X-Demo-Token", "reason": "invalid"}])
             return False
         return True
 
@@ -745,8 +756,9 @@ class Handler(BaseHTTPRequestHandler):
                 "auth_required": True,
                 "auth_configured": bool(DEMO_TOKEN),
                 "admin_configured": bool(ADMIN_KEY),
-                "token_sha8": _fp(DEMO_TOKEN),
-                "admin_sha8": _fp(ADMIN_KEY),
+                # M0 2026-11-07 令 D：删掉 token_sha8 / admin_sha8。口令指纹即便不可逆，
+                # 也让人可以离线比对字典，且对运维没有用处（要验「变量进没进来」只看
+                # 上面两个 bool 就够）。
                 "bind": os.environ.get("BIND", "127.0.0.1"),
                 "port": os.environ.get("PORT", "8790"),
                 "starts_at": _STATS["starts_at"],
