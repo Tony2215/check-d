@@ -24,8 +24,15 @@ import re
 import sys
 import uuid
 
-MIGRATION = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                         "db", "0001_snapshot_r3.sql")
+# M2 12:15 P0-1：原先 dirname(dirname(__file__)) 拼到 tools/db/…，与本文件在
+# tools/m1-server/ 的实际布局不一致，--apply 直接 FileNotFoundError（且 open() 在 try 外会裸崩）。
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_CANDIDATES = [
+    os.path.join(_HERE, "migrations", "0001_snapshot_r3.sql"),   # 仓库内原地
+    os.path.join(_HERE, "db", "0001_snapshot_r3.sql"),           # work/m1/db 副本
+    os.path.join(os.path.dirname(_HERE), "m1", "db", "0001_snapshot_r3.sql"),
+]
+MIGRATION = next((c for c in _CANDIDATES if os.path.exists(c)), _CANDIDATES[0])
 
 RESULTS = []
 
@@ -37,16 +44,35 @@ def rec(name, ok, detail=""):
 
 def safe_dsn(dsn):
     """只暴露 host / dbname，绝不打印口令。"""
-    m = re.match(r"^[a-z+]+://([^:]+):([^@]*)@([^/]+)/([^?\s]+)", dsn)
+    # 口令里可能含 @（M2 12:15 P2）。从右边找最后一个 @ 才是 host 分隔符。
+    m = re.match(r"^([a-z+]+)://(.+)$", dsn)
     if not m:
         return {"host": "(无法解析)", "dbname": "(无法解析)"}
-    return {"host": m.group(3), "dbname": m.group(4), "user": m.group(1)}
+    rest = m.group(2)
+    if "@" not in rest:
+        return {"host": "(无法解析)", "dbname": "(无法解析)"}
+    userinfo, hostpart = rest.rsplit("@", 1)
+    user = userinfo.split(":", 1)[0]
+    host = hostpart.split("/", 1)[0]
+    db = hostpart.split("/", 1)[1] if "/" in hostpart else ""
+    db = db.split("?", 1)[0]
+    return {"host": host, "dbname": db, "user": user}
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--apply", action="store_true", help="先执行 migration，再检查")
+    ap.add_argument("--i-have-m0-approval", action="store_true",
+                    help="M0 已对精确执行计划书面批准时才加。没有它 --apply 一律拒绝")
     args = ap.parse_args()
+
+    # M0 2026-11-07T04:05:25Z §四 明写：未对精确执行计划单独批准前，不得运行 --apply。
+    # 给它一道硬闸，而不是靠我记得。只读检查不需要这道闸。
+    if args.apply and not args.i_have_m0_approval:
+        print("REFUSED: --apply 会写库（建 schema/表 + 插入并删除测试数据）。")
+        print("         M0 工单 §四 要求先提交精确执行计划并获批。")
+        print("         获批后加 --i-have-m0-approval 再跑。只读检查请去掉 --apply。")
+        return 3
 
     dsn = os.environ.get("CHECKD_DEMO_DSN") or os.environ.get("DATABASE_URL")
     if not dsn:
@@ -79,22 +105,35 @@ def main():
             row = conn.execute("select current_database(), current_user, version()").fetchone()
             rec("连接 / 库名", True, "%s as %s" % (row[0], row[1]))
             ver = row[2].split()[1] if len(row[2].split()) > 1 else "?"
-            rec("服务端版本 >= 14", tuple(int(x) for x in re.findall(r"\d+", ver)[:2]) >= (14, 0), ver)
+            parts = tuple(int(x) for x in re.findall(r"\d+", ver)[:2]) or (0,)
+            rec("服务端版本 >= 14", (parts + (0,))[:2] >= (14, 0), ver)
             pid1 = conn.execute("select pg_backend_pid()").fetchone()[0]
             pid2 = conn.execute("select pg_backend_pid()").fetchone()[0]
             rec("连接后端稳定（非每语句换后端）", pid1 == pid2, "pid=%s/%s" % (pid1, pid2))
 
             # ---------- 1 工单要求的迁移可执行 ----------
             if args.apply:
-                sql = open(MIGRATION, encoding="utf-8").read()
+                if not os.path.exists(MIGRATION):
+                    rec("migration 文件存在", False, MIGRATION)
+                    sql = None
+                else:
+                    sql = open(MIGRATION, encoding="utf-8").read()
+                    rec("migration 文件存在", True, "%d B" % len(sql.encode("utf-8")))
                 try:
-                    conn.execute(sql)
+                    if sql is None:
+                        raise FileNotFoundError(MIGRATION)
+                    # P0-2：psycopg3 默认走 extended protocol，多语句会报
+                    # "cannot insert multiple commands into a prepared statement"。
+                    # R3 含多个语句与两个 do $$ 块，必须 prepare=False 走 simple query。
+                    conn.execute(sql, prepare=False)
                     rec("migration R3 首次执行", True, "%d B" % len(sql.encode("utf-8")))
                 except Exception as e:                       # noqa: BLE001
                     rec("migration R3 首次执行", False, "%s: %s" % (type(e).__name__, e))
                 # 幂等：再跑一遍必须不报错
                 try:
-                    conn.execute(sql)
+                    if sql is None:
+                        raise FileNotFoundError(MIGRATION)
+                    conn.execute(sql, prepare=False)
                     rec("migration R3 重复执行（幂等）", True, "")
                 except Exception as e:                       # noqa: BLE001
                     rec("migration R3 重复执行（幂等）", False, "%s: %s" % (type(e).__name__, e))
@@ -161,7 +200,7 @@ def main():
                     conn.execute("insert into checkd_demo.proposal "
                                  "(user_id,snapshot_id,snapshot_version,expires_at) "
                                  "values (%s,%s,3, now()+interval '10 min')",
-                                 ("other-user-" + uuid.uuid4().hex[:6], sid))
+                                 ("preflight-other-" + uuid.uuid4().hex[:6], sid))
                 rec("跨用户 proposal 指向他人 snapshot 被拒", False, "插进去了，P0-1 未生效")
             except Exception as e:                           # noqa: BLE001
                 ok = "23503" in str(e) or "foreign key" in str(e).lower()
@@ -226,6 +265,37 @@ def main():
                 has = conn.execute(
                     "select has_schema_privilege(%s,'checkd_demo','usage')", (role,)).fetchone()[0]
                 rec("%s 无 schema usage（P2-4）" % role, not has, "has_usage=%s" % has)
+
+            # ---------- 9 应用角色必须**有**权限（M2 12:15 P0-3）----------
+            # 上面只验了"内置角色没有权限"（反向）。真正会让应用挂掉的是：
+            # 应用角色自己没权限，而 preflight 全绿 —— 这个洞必须正向验一遍。
+            app_role = os.environ.get("CHECKD_APP_ROLE", "checkd_demo_app")
+            has_role = conn.execute("select 1 from pg_roles where rolname=%s",
+                                    (app_role,)).fetchone()
+            if not has_role:
+                rec("应用角色 %s 存在" % app_role, False, "角色不存在——应用连上会 permission denied")
+            else:
+                rec("应用角色 %s 存在" % app_role, True, "")
+                try:
+                    ok_usage = conn.execute(
+                        "select has_schema_privilege(%s,'checkd_demo','usage')",
+                        (app_role,)).fetchone()[0]
+                    rec("应用角色有 schema usage", ok_usage, "usage=%s" % ok_usage)
+                    for tbl, want in (("snapshot", ("select", "insert", "update")),
+                                      ("proposal", ("select", "insert", "update")),
+                                      ("applied_change", ("select", "insert")),
+                                      ("snapshot_seq", ("select", "insert", "update"))):
+                        missing = [w for w in want if not conn.execute(
+                            "select has_table_privilege(%s,%s,%s)",
+                            (app_role, "checkd_demo." + tbl, w)).fetchone()[0]]
+                        rec("应用角色对 %s 有 %s" % (tbl, "/".join(want)),
+                            not missing, "缺: %s" % missing if missing else "齐")
+                    can_ddl = conn.execute(
+                        "select has_schema_privilege(%s,'checkd_demo','create')",
+                        (app_role,)).fetchone()[0]
+                    rec("应用角色无 create 权（最小权限）", not can_ddl, "create=%s" % can_ddl)
+                except Exception as e:                   # noqa: BLE001
+                    rec("应用角色权限检查", False, "%s: %s" % (type(e).__name__, e))
 
     finally:
         try:

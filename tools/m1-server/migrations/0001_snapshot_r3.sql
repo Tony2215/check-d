@@ -49,8 +49,15 @@ begin
     select 1 from information_schema.tables
      where table_schema = 'checkd_demo' and table_name = 'applied_change'
   ) and not exists (
-    select 1 from pg_constraint
-     where conname = 'applied_change_proposal_snapshot_fk'
+    -- 必须限定到本 schema 的这张表上。只按 conname 查，别的 schema 有同名约束
+    -- 就会误判成"已存在"，于是 guard 放行、约束却没生效（M2 12:13 P2①）。
+    select 1
+      from pg_constraint c
+      join pg_class t on t.oid = c.conrelid
+      join pg_namespace n on n.oid = t.relnamespace
+     where c.conname = 'applied_change_proposal_snapshot_fk'
+       and n.nspname = 'checkd_demo'
+       and t.relname = 'applied_change'
   ) then
     raise exception
       '检测到 R1/R2 残留 schema（applied_change 已存在但缺 R3 的 proposal↔snapshot 一致性约束）。本脚本不做原地升级，也不会自动清理；请换全新独立 DEMO 库执行。';
@@ -179,18 +186,36 @@ create table if not exists checkd_demo.applied_change (
 );
 
 -- ============================================================
--- 5. 权限（P2-4：并入本文件，原先散在文档里，漏执行就前功尽弃）
---    原则：默认拒绝。schema 不给 public；Supabase 的 anon / authenticated
---    若存在也一并收回（这两个角色默认有 public schema 权限）。
---    只授予本连接使用的那一个角色（当前连接用户 + 可选 CHECKD_APP_ROLE）。
+-- 5. 权限（P2-4：并入本文件；M2 12:13 报的 P0 已修）
+--
+-- 关键修正：原先把权限授给 current_user —— 在 Supabase 上那是执行 SQL 的 postgres，
+-- 不是应用连接角色。而上面已经把 public 收掉了，于是应用角色既不在 grant 里、
+-- 也不在 public 里 → 连上去直接 permission denied。
+-- 授权必须给**应用真正使用的那个角色**，且 current_user 的权限对它没有传递性。
+--
+-- 角色名硬编码为 checkd_demo_app（M2 指出的方案①；SQL Editor 不支持 psql 变量）。
+-- 角色不存在则建（nologin，不设密码，只用于授权）。
 -- ============================================================
 revoke all on schema checkd_demo from public;
 
 do $$
 declare
+  app_role text := 'checkd_demo_app';
   r text;
 begin
-  -- 5.1 收掉 Supabase 内置角色的权限（角色不存在则跳过，纯 PG 环境不报错）
+  -- 5.1 建应用角色（已存在则复用）。建不了就直接失败——不能静默跳过，
+  --     否则后面的 grant 会静默失效，最后表现为"应用连不上"而脚本说成功。
+  if not exists (select 1 from pg_roles where rolname = app_role) then
+    begin
+      execute format('create role %I nologin', app_role);
+    exception when insufficient_privilege then
+      raise exception
+        '无法创建角色 %（缺少 CREATEROLE 权限）。请先由库管理员手工执行 create role %I nologin，再重跑本脚本。',
+        app_role, app_role;
+    end;
+  end if;
+
+  -- 5.2 收回 Supabase 内置角色的权限（角色不存在则跳过，纯 PG 环境不报错）
   foreach r in array array['anon', 'authenticated'] loop
     if exists (select 1 from pg_roles where rolname = r) then
       execute format('revoke all on schema checkd_demo from %I', r);
@@ -198,17 +223,23 @@ begin
     end if;
   end loop;
 
-  -- 5.2 schema 使用权限只给当前连接用户（迁移执行者 = 应用角色时不需额外授）
-  execute format('grant usage on schema checkd_demo to %I', current_user);
-
-  -- 5.3 表级权限：服务端只需要读 + 写，不需要 DDL
+  -- 5.3 授给应用角色：只给 usage + DML，不给 DDL
+  execute format('grant usage on schema checkd_demo to %I', app_role);
   execute format('grant select, insert, update on all tables in schema checkd_demo to %I',
-                 current_user);
+                 app_role);
+
+  -- 5.4 显式收回建表/删表权。grant usage 本身不含 create，但显式收回是为了
+  --     防止有人手工补过权限后这里没人再纠正。
+  execute format('revoke create on schema checkd_demo from %I', app_role);
+  execute format('revoke delete, truncate, references, trigger on all tables '
+                 'in schema checkd_demo from %I', app_role);
 end $$;
 
--- 5.4 以后新建的表也自动只给当前用户（本迁移之后再无新表，留着防以后加表漏配）
+-- 5.5 以后新建的表也自动只给应用角色读写的同类权限
 alter default privileges in schema checkd_demo
   revoke all on tables from public;
+alter default privileges in schema checkd_demo
+  grant select, insert, update on tables to checkd_demo_app;
 
 -- ============================================================
 -- 6. 发号：单语句，禁止 select max+1
