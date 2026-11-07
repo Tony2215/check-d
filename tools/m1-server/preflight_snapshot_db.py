@@ -154,27 +154,29 @@ def safe_dsn(dsn):
 
 
 def default_out():
-    """结果 JSON 的固定默认路径 —— **与当前工作目录无关**（M0 令 N1）。
+    """结果 JSON 的**唯一**默认路径 —— 不随当前目录变，也不随环境变（M0 令 N1）。
 
-    优先级 1（本机工作区布局）：上溯找到 `work/` 且其下有 `m1/`
-        → `work/m1/preflight_snapshot_db_result.json`（与邮件口径一致）。
-    优先级 2（干净 clone，如 M0 的 Mac）：脚本在 `<repo>/tools/m1-server/` 下，
-        取上两级即仓库根 → `<repo>/preflight_snapshot_db_result.json`。
+    固定为 `<仓库根>/preflight_snapshot_db_result.json`，其中仓库根由本文件位置
+    上溯确定（找同时含 `tools/` 与 `tools/m1-server/` 的目录）。
 
-    旧版在两级都找不到时静默回退 `os.getcwd()`，同一个脚本在不同目录跑会写到
-    不同位置，和邮件承诺的路径不一致（M0 2026-11-07 阻断件 N1）。
-    本版不再回退 cwd；需要别的路径请显式 `--out`。
+    为什么不再"能找到 work/m1 就写那里"：那样同一个脚本在本机工作区和干净 clone
+    下会写到两个位置，M0 执行前无法预测该去哪取文件 —— 这正是 N1 的原始问题，
+    只把 cwd 换成"两套规则"不算修好。现在只有一处，脚本启动时就把绝对路径打出来。
+
+    要写到别处用 `--out /path/to/file.json`。
     """
     p = _HERE
     for _ in range(8):
-        if os.path.basename(p) == "work" and os.path.isdir(os.path.join(p, "m1")):
-            return os.path.join(p, "m1", "preflight_snapshot_db_result.json")
+        if (os.path.isdir(os.path.join(p, "tools"))
+                and os.path.isdir(os.path.join(p, "tools", "m1-server"))):
+            return os.path.join(p, "preflight_snapshot_db_result.json")
         parent = os.path.dirname(p)
         if parent == p:
             break
         p = parent
-    repo_root = os.path.dirname(os.path.dirname(_HERE))       # tools/m1-server → repo
-    return os.path.join(repo_root, "preflight_snapshot_db_result.json")
+    # 兜底：仍是脚本位置推出来的固定值，绝不回退 cwd
+    return os.path.join(os.path.dirname(os.path.dirname(_HERE)),
+                        "preflight_snapshot_db_result.json")
 
 
 # ------------------------------------------------------------------ 只读检查

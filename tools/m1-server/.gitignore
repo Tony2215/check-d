@@ -1,0 +1,3 @@
+# preflight 的输出文件。默认写到仓库根，跑一次就会冒出来；
+# 它不是源码，也不该被提交（里面有目标库 host/dbname/user 与检查结果）。
+preflight_snapshot_db_result.json

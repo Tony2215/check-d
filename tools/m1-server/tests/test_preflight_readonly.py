@@ -153,10 +153,38 @@ class TestStaticAudit(unittest.TestCase):
 
 
 class TestOutputPath(unittest.TestCase):
-    def test_default_out_is_work_m1(self):
+    """N1（M0 2026-11-07）：结果路径必须唯一、可预测，不随 cwd 或环境变。
+
+    旧版先找 work/m1，找不到回退 cwd —— 同一脚本两个出口，M0 执行前不知道去哪取文件。
+    """
+
+    def test_default_out_is_fixed_repo_root(self):
         out = pf.default_out().replace("\\", "/")
-        self.assertTrue(out.endswith("m1/preflight_snapshot_db_result.json"), out)
-        self.assertIn("/work/m1/", out, out)
+        self.assertTrue(out.endswith("/preflight_snapshot_db_result.json"), out)
+        self.assertNotIn("/work/m1/", out,
+                         "不允许再按环境分叉出第二套路径（N1）")
+        # 仓库根 = 含 tools/m1-server 的那一级
+        repo_root = out.rsplit("/", 1)[0]
+        self.assertTrue(os.path.isdir(os.path.join(repo_root, "tools", "m1-server")),
+                        "结果文件必须落在仓库根：%s" % repo_root)
+
+    def test_default_out_does_not_depend_on_cwd(self):
+        before = pf.default_out()
+        cwd = os.getcwd()
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            try:
+                os.chdir(d)
+                self.assertEqual(pf.default_out(), before,
+                                 "换工作目录后结果路径变了，M0 就无法预测去哪取文件")
+            finally:
+                os.chdir(cwd)
+
+    def test_gitignored(self):
+        gi = os.path.join(SRC_DIR, ".gitignore")
+        self.assertTrue(os.path.exists(gi), "输出文件必须被忽略，否则跑一次就脏工作区")
+        self.assertIn("preflight_snapshot_db_result.json",
+                      open(gi, encoding="utf-8").read())
 
     def test_default_out_independent_of_cwd(self):
         """N1（M0 2026-11-07）：结果路径不得随 cwd 变。
