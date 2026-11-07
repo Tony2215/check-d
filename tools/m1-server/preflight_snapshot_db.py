@@ -205,13 +205,17 @@ def check_schema(conn):
     rec("4 张表齐全", tabs == want_tabs, ",".join(tabs) if tabs else "(schema 为空或不存在)")
 
     cons = [r[0] for r in ro_exec(conn, RO_SQL["constraints"], ("checkd_demo",)).fetchall()]
+    # 13 条：11 条为 P0-1/P1/P2 主约束，另 2 条是 2026-11-07 追加的版本维度约束
+    # （snapshot_id_version_uk + proposal_snapshot_version_fk），缺任一条 base_version
+    # 都可能被传参伪造，所以这里必须逐条点名，不能只数个数。
     want = ["applied_change_proposal_fk", "applied_change_proposal_snapshot_fk",
             "applied_change_proposal_uk", "applied_change_snapshot_fk",
             "proposal_id_snapshot_uk", "proposal_id_user_uk",
-            "proposal_snapshot_fk", "proposal_ttl_ck",
-            "snapshot_id_user_uk", "snapshot_ttl_ck", "snapshot_version_uk"]
+            "proposal_snapshot_fk", "proposal_snapshot_version_fk",
+            "proposal_ttl_ck", "snapshot_id_user_uk", "snapshot_id_version_uk",
+            "snapshot_ttl_ck", "snapshot_version_uk"]
     missing = [c for c in want if c not in cons]
-    rec("关键约束 11 条", not missing, "缺: %s" % missing if missing else "%d 条" % len(cons))
+    rec("关键约束 13 条", not missing, "缺: %s" % missing if missing else "%d 条" % len(cons))
 
     idx = [r[0] for r in ro_exec(conn, RO_SQL["indexes"], ("checkd_demo",)).fetchall()]
     rec("latest 唯一索引存在", "snapshot_one_latest" in idx, ",".join(sorted(idx)) or "(无)")

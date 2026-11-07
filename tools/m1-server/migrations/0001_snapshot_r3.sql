@@ -45,20 +45,24 @@ begin
   -- 0.2 表已在、但 R3 才有的约束不在 → 说明是 R1/R2 残留。
   --     if not exists 会静默跳过建表，于是留下"表是旧的、脚本以为建好了"的状态。
   --     这种状态最难查：跑起来不报错，约束却没生效。
+  --     2026-11-07 扩为「四条必须一条不缺」：R3 中途又加了 P1-2 两条（版本维度），
+  --     只查一条会放过「有旧约束、缺新约束」的半新半旧状态。
   if exists (
     select 1 from information_schema.tables
      where table_schema = 'checkd_demo' and table_name = 'applied_change'
-  ) and not exists (
+  ) and (
     -- 必须限定到本 schema 的这张表上。只按 conname 查，别的 schema 有同名约束
     -- 就会误判成"已存在"，于是 guard 放行、约束却没生效（M2 12:13 P2①）。
-    select 1
+    select count(*)
       from pg_constraint c
       join pg_class t on t.oid = c.conrelid
       join pg_namespace n on n.oid = t.relnamespace
-     where c.conname = 'applied_change_proposal_snapshot_fk'
-       and n.nspname = 'checkd_demo'
-       and t.relname = 'applied_change'
-  ) then
+     where n.nspname = 'checkd_demo'
+       and c.conname in ('applied_change_proposal_snapshot_fk',
+                         'proposal_id_snapshot_uk',
+                         'proposal_snapshot_version_fk',
+                         'snapshot_id_version_uk')
+  ) < 4 then
     raise exception
       '检测到 R1/R2 残留 schema（applied_change 已存在但缺 R3 的 proposal↔snapshot 一致性约束）。本脚本不做原地升级，也不会自动清理；请换全新独立 DEMO 库执行。';
   end if;
@@ -105,7 +109,11 @@ create table if not exists checkd_demo.snapshot (
   constraint snapshot_version_uk  unique (user_id, date_from, date_to, version),
   -- P0-1 关键：给 proposal / applied_change 的复合 FK 一个可指向的键。
   -- 单列 FK 允许 A 用户 proposal 指向 B 用户 snapshot，库不会拒；这一条才堵住。
-  constraint snapshot_id_user_uk  unique (snapshot_id, user_id)
+  constraint snapshot_id_user_uk  unique (snapshot_id, user_id),
+  -- P1-2（M3 2026-11-07 审查）：给 proposal.snapshot_version 一个可指向的键。
+  -- 没有它，proposal 只能锁"这个 snapshot_id 属于谁"，锁不住"版本号对不对" ——
+  -- 传 999 也写得进去，base_version 生成列随之变成「<uuid>:999」这种假可信版本。
+  constraint snapshot_id_version_uk unique (snapshot_id, version)
 );
 
 -- 同 (user_id, date_from, date_to) 任何时刻最多一个 latest
@@ -149,6 +157,11 @@ create table if not exists checkd_demo.proposal (
   -- P0-1：复合 FK。proposal.user_id 必须与自己引用的 snapshot.user_id 相同
   constraint proposal_snapshot_fk foreign key (snapshot_id, user_id)
     references checkd_demo.snapshot (snapshot_id, user_id),
+  -- P1-2（M3 2026-11-07 审查）：上面那条只锁"归属"，锁不住"版本号"。
+  -- 这条把 snapshot_version 钉死在该快照真实存在的 version 上，
+  -- 于是 base_version 生成列的值不可能被调用方传参伪造。
+  constraint proposal_snapshot_version_fk foreign key (snapshot_id, snapshot_version)
+    references checkd_demo.snapshot (snapshot_id, version),
   -- 供 applied_change 复合 FK 指向（P0-1 用 user 维度）
   constraint proposal_id_user_uk unique (proposal_id, user_id),
   -- P1(R3 新增)：供 applied_change 用 snapshot 维度指向。

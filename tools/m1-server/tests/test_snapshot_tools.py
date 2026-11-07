@@ -143,7 +143,10 @@ class _FakeStore:
             raise ss.SnapshotStoreError("NOT_FOUND", "提案不存在。")
         snap = self.snapshots[p["snapshot_id"]]
         return dict(p, date_from=snap["date_from"], date_to=snap["date_to"],
-                    snapshot_payload_digest=snap["payload_digest"])
+                    snapshot_payload_digest=snap["payload_digest"],
+                    # P0-1：快照自己的 TTL 判定结果，真实 store 由 SQL 的
+                    # (s.expires_at <= now()) 算出来；这里用标记位模拟。
+                    snapshot_expired=snap.get("snapshot_expired", False))
 
     def get_snapshot_payload(self, snapshot_id, user_id):
         snap = self.snapshots.get(snapshot_id)
@@ -360,6 +363,78 @@ class TestApply(_Base):
                             _env({"proposal_id": prop["proposal_id"],
                                   "base_version": "snap-01:99"}), "u_alice")
         self.assertEqual(ctx.exception.code, "SNAPSHOT_CONFLICT")
+
+
+class TestSnapshotTTL(_Base):
+    """P0-1（M3 2026-11-07 审查）：快照 TTL 没接入任何判定路径。
+
+    原先 validate / request_approval / apply 三条路都只看 proposal.expires_at，
+    snapshot.expires_at 存了却从没被读过。默认 proposal TTL(600s) < snapshot TTL(900s)，
+    所以正常流程永远掩盖它；一旦把 snapshot TTL 调短，就能拿过期快照照样校验、审批、apply。
+
+    这里把三个入口分别钉住，并额外证明「proposal 没过期也一样被拦」——
+    否则可能只是 proposal 过期先报，测试假绿。
+    """
+
+    DATE = {"date_range": {"start": "2026-10-30", "end": "2026-10-30"}}
+
+    def _generate(self, user="u_alice"):
+        return self.tools.call("generate_schedule", _env(self.DATE), user)
+
+    def _expire_snapshot(self, prop):
+        # 从 store 反查 snap_id：generate 的返回里叫 snapshot_ref，不叫 snapshot_id
+        sid = self.store.proposals[prop["proposal_id"]]["snapshot_id"]
+        self.store.snapshots[sid]["snapshot_expired"] = True
+
+    def test_validate_rejects_expired_snapshot(self):
+        prop = self._generate()
+        self._expire_snapshot(prop)
+        with self.assertRaises(ss.SnapshotStoreError) as ctx:
+            self.tools.call("validate_schedule",
+                            _env({"proposal_id": prop["proposal_id"]}), "u_alice")
+        self.assertEqual(ctx.exception.code, "SNAPSHOT_CONFLICT")
+
+    def test_approval_rejects_expired_snapshot(self):
+        prop = self._generate()
+        self.tools.call("validate_schedule", _env({"proposal_id": prop["proposal_id"]}), "u_alice")
+        self._expire_snapshot(prop)
+        with self.assertRaises(ss.SnapshotStoreError) as ctx:
+            self.tools.call("request_approval",
+                            _env({"proposal_id": prop["proposal_id"],
+                                  "idempotency_key": "k-ttl"}), "u_alice")
+        self.assertEqual(ctx.exception.code, "SNAPSHOT_CONFLICT")
+
+    def test_apply_rejects_expired_snapshot(self):
+        prop = self._full_chain()
+        os.environ[st.WRITE_ALLOWLIST_ENV] = "u_alice"
+        mock.STATE["approvals"][self._approval_for(prop)]["status"] = "approved"
+        self._expire_snapshot(prop)
+        with self.assertRaises(ss.SnapshotStoreError) as ctx:
+            self.tools.call("apply_approved_changes",
+                            _env({"proposal_id": prop["proposal_id"],
+                                  "base_version": prop["base_version"]}), "u_alice")
+        self.assertEqual(ctx.exception.code, "SNAPSHOT_CONFLICT")
+        self.assertEqual(self.store.applied, {}, "快照过期时一行都不能写")
+
+    def test_proposal_alive_but_snapshot_dead_still_blocked(self):
+        """proposal 没过期、只有快照过期 —— 必须仍然被拦，证明判的是快照的 TTL。"""
+        prop = self._generate()
+        self.tools.call("validate_schedule", _env({"proposal_id": prop["proposal_id"]}), "u_alice")
+        # proposal 明确未过期
+        self.store.proposals[prop["proposal_id"]]["expired"] = False
+        self._expire_snapshot(prop)
+        with self.assertRaises(ss.SnapshotStoreError) as ctx:
+            self.tools.call("request_approval",
+                            _env({"proposal_id": prop["proposal_id"],
+                                  "idempotency_key": "k-ttl2"}), "u_alice")
+        self.assertEqual(ctx.exception.code, "SNAPSHOT_CONFLICT")
+        self.assertNotEqual(ctx.exception.code, "PROPOSAL_EXPIRED",
+                            "不能靠 proposal 过期蒙对")
+
+    def test_no_false_positive_when_both_alive(self):
+        """两个 TTL 都没过期时必须照常通过，否则上面几条就是「一律拒绝」的假绿。"""
+        prop = self._full_chain()
+        self.assertEqual(prop["proposal_id"][:5], "prop-")
 
 
 if __name__ == "__main__":

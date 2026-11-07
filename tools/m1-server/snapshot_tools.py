@@ -176,6 +176,12 @@ class SnapshotTools:
         if gate["status"] == "applied":
             _bad("ALREADY_APPLIED", "提案已应用，不能再次校验。",
                  proposal_id=pid)
+        # P0-1（M3 2026-11-07 审查）：快照过期后不得再校验。
+        # 以前只看 proposal.expires_at，快照 TTL 存了却没人读 —— 调短就漏。
+        # 复用契约已有的 SNAPSHOT_CONFLICT，不新增错误码。
+        if gate["snapshot_expired"]:
+            _bad("SNAPSHOT_CONFLICT", "快照已过期，需重新生成提案。",
+                 snapshot_id=gate["snapshot_id"])
 
         snap = self._store.get_snapshot_payload(gate["snapshot_id"], user)
         payload = snap.get("payload") or {}
@@ -240,6 +246,9 @@ class SnapshotTools:
             _bad("ALREADY_APPLIED", "提案已应用，不能再次审批。", proposal_id=pid)
         if gate["expired"] or gate["status"] == "expired":
             _bad("PROPOSAL_EXPIRED", "提案已过期。", proposal_id=pid)
+        if gate["snapshot_expired"]:
+            _bad("SNAPSHOT_CONFLICT", "快照已过期，需重新生成提案。",
+                 snapshot_id=gate["snapshot_id"])
         if gate["validation_status"] != "valid":
             _bad("PROPOSAL_INVALID", "提案尚未通过校验。",
                  validation_status=gate["validation_status"])
@@ -322,6 +331,9 @@ class SnapshotTools:
                  proposal_id=pid)
         if gate["expired"] or gate["status"] == "expired":
             _bad("PROPOSAL_EXPIRED", "提案已过期。", proposal_id=pid)
+        if gate["snapshot_expired"]:
+            _bad("SNAPSHOT_CONFLICT", "快照已过期，需重新生成提案。",
+                 snapshot_id=gate["snapshot_id"])
         if gate["validation_status"] != "valid":
             _bad("PROPOSAL_INVALID", "提案未通过校验，不能应用。")
         if str(gate["base_version"]) != str(base_version):

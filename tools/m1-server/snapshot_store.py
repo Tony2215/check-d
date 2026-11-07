@@ -337,7 +337,7 @@ class SnapshotStore:
                     "version": version,
                     # 库里是生成列，正常路径应该读回来；这里按同一规则给出，
                     # 并在 get_snapshot 里以库值为准做一次自校验。
-                    "base_version": "%s:%d" % (snapshot_id, version),
+                    "base_version": _base_version(snapshot_id, version),
                     "payload_digest": digest,
                     "payload_bytes": nbytes,
                     "expires_at": _iso(expires_at),
@@ -374,7 +374,7 @@ class SnapshotStore:
             "user_id": row[2],
             "date_from": _iso_date(row[3]),
             "date_to": _iso_date(row[4]),
-            "base_version": "%s:%d" % (row[0], int(row[1])),
+            "base_version": _base_version(row[0], row[1]),
             "payload_digest": row[5],
             "payload_bytes": int(row[6]),
             "expires_at": _iso(row[7]),
@@ -435,7 +435,7 @@ class SnapshotStore:
         return {
             "snapshot_id": str(row[0]),
             "version": int(row[1]),
-            "base_version": "%s:%d" % (row[0], int(row[1])),
+            "base_version": _base_version(row[0], row[1]),
             "payload_digest": row[2],
             "payload_bytes": int(row[3]),
             "expires_at": _iso(row[4]),
@@ -523,6 +523,7 @@ class SnapshotStore:
                     "       p.base_version, p.status, p.validation_status, p.plan, "
                     "       p.expires_at, p.applied_at, "
                     "       (p.expires_at <= now()) as expired, "
+                    "       (s.expires_at <= now()) as snapshot_expired, "
                     "       s.date_from, s.date_to, s.payload_digest "
                     "  from checkd_demo.proposal p "
                     "  join checkd_demo.snapshot s "
@@ -548,9 +549,14 @@ class SnapshotStore:
             "expires_at": _iso(row[8]),
             "applied_at": _iso(row[9]),
             "expired": bool(row[10]),
-            "date_from": _iso_date(row[11]),
-            "date_to": _iso_date(row[12]),
-            "snapshot_payload_digest": row[13],
+            # P0-1（M3 2026-11-07 审查）：快照自己的 TTL。
+            # 原先只判 p.expires_at，snapshot.expires_at 存了却从没被读过 ——
+            # 默认 proposal TTL 600s < snapshot TTL 900s，所以「提案先过期」掩盖了这个洞；
+            # 一旦把 snapshot TTL 调短，就会出现「拿过期快照 validate/apply」。
+            "snapshot_expired": bool(row[11]),
+            "date_from": _iso_date(row[12]),
+            "date_to": _iso_date(row[13]),
+            "snapshot_payload_digest": row[14],
         }
 
     def set_validation(self, proposal_id, user_id, validation_status):
@@ -621,11 +627,21 @@ class SnapshotStore:
 
         try:
             with self._ex.transaction() as conn:
-                # 1) 锁提案。for update 让并发 apply 串行在这一行上
+                # 1) 锁提案。for update 让并发 apply 串行在这一行上。
+                #    只锁 p（for update of p）：锁序仍是 proposal → snapshot，
+                #    不要因为多了一个 join 就把 snapshot 行一起锁上。
+                #    M3 P2②：过期原先在下面用 _expired() 再查一次，同事务内 now() 不变，
+                #    纯多一次 round trip。这里两条过期判定都随这条查询一起取回。
                 row = conn.execute(
-                    "select status, snapshot_id, snapshot_version, base_version, expires_at, plan "
-                    "  from checkd_demo.proposal "
-                    " where proposal_id = %s and user_id = %s for update",
+                    "select p.status, p.snapshot_id, p.snapshot_version, p.base_version, "
+                    "       p.expires_at, p.plan, "
+                    "       (p.expires_at <= now()) as p_expired, "
+                    "       (s.expires_at <= now()) as s_expired "
+                    "  from checkd_demo.proposal p "
+                    "  join checkd_demo.snapshot s "
+                    "    on s.snapshot_id = p.snapshot_id and s.user_id = p.user_id "
+                    " where p.proposal_id = %s and p.user_id = %s "
+                    "   for update of p",
                     (proposal_id, user_id),
                 ).fetchone()
                 if row is None:
@@ -634,7 +650,8 @@ class SnapshotStore:
                 status, snap_id, snap_ver, db_base_version, expires_at = row[:5]
                 # 契约 L514：服务端必须加载自己保存的 Proposal，不接受调用方重传。
                 # 所以方案从这一行里读，不从入参拿。
-                saved_plan = row[5] if len(row) > 5 else None
+                saved_plan = row[5]
+                p_expired, s_expired = bool(row[6]), bool(row[7])
 
                 # 2) 已应用 → 幂等错误，不是"成功"
                 if status == "applied":
@@ -649,11 +666,19 @@ class SnapshotStore:
                         "提案状态为 %s，不能应用。" % status,
                         details={"status": status})
 
-                # 4) 过期由库判，不用客户端时间
-                if _expired(conn, str(proposal_id)):
+                # 4) 过期由库判，不用客户端时间（同一事务内 now() 恒定，随上面那条查询取回）
+                if p_expired:
                     raise SnapshotStoreError(
                         _CODE_PROPOSAL_EXPIRED, "提案已过期。",
                         details={"proposal_id": str(proposal_id)})
+                # 4b) 快照自己也不能过期（P0-1）。快照比提案活得更久是默认配置下的常态，
+                #     所以这条平时不触发；一旦 TTL 被调短，它才是拦住「过期快照仍可 apply」的那道闸。
+                if s_expired:
+                    raise SnapshotStoreError(
+                        _CODE_SNAPSHOT_CONFLICT,
+                        "快照已过期，需重新生成提案。",
+                        details={"proposal_id": str(proposal_id),
+                                 "snapshot_id": str(snap_id)})
 
                 # 5) 版本必须与库里一致（库里是生成列，客户端传的只是"我以为的"）
                 if str(db_base_version) != str(base_version):
@@ -722,21 +747,26 @@ def _require_date_order(date_from, date_to):
                                           "date_to": str(date_to)})
 
 
-def _expired(conn, proposal_id):
-    row = conn.execute(
-        "select (expires_at <= now()) as expired from checkd_demo.proposal "
-        " where proposal_id = %s",
-        (proposal_id,),
-    ).fetchone()
-    return bool(row and row[0])
+def _constraint_of(exc):
+    """从驱动异常里取违反的约束名，取不到返回 None。
+
+    M3 2026-11-07 审查 P2①：原先靠 `str(exc)` 里是否出现 "applied_change" /
+    "snapshot_one_latest" 来判断，驱动改一次错误措辞就会把 409 退化成 500。
+    psycopg3 把约束名放在 `exc.diag.constraint_name`（服务端 ErrorResponse 的
+    constraint 字段），那是结构化字段，不受措辞影响。
+    """
+    diag = getattr(exc, "diag", None)
+    if diag is None:
+        return None
+    return getattr(diag, "constraint_name", None) or None
 
 
 def _map_db_error(exc, where):
     """把驱动异常映射到契约闭集内的码。不新增码。
 
-    23505 unique_violation → 两种可能，靠上下文区分：
-        含 applied_change → ALREADY_APPLIED（幂等闸）
-        含 snapshot_one_latest → SNAPSHOT_CONFLICT（并发建快照）
+    23505 unique_violation → 靠约束名区分：
+        applied_change_proposal_uk → ALREADY_APPLIED（幂等闸）
+        snapshot_one_latest        → SNAPSHOT_CONFLICT（并发建快照）
     23503 foreign_key_violation → 用户归属违约（复合 FK 拦住），属服务端拼错 id
     40001 / 40P01 → 序列化失败/死锁，可重试
     其余 → DEPENDENCY_UNAVAILABLE（连接类）或 INTERNAL_ERROR
@@ -744,19 +774,26 @@ def _map_db_error(exc, where):
     name = type(exc).__name__
     pgcode = getattr(exc, "sqlstate", None) or getattr(exc, "pgcode", None)
     text = str(exc)
+    constraint = _constraint_of(exc)
+
+    def _hit(*needles):
+        """先看结构化约束名；拿不到才退回文本匹配（老驱动/老服务端的兜底）。"""
+        if constraint:
+            return constraint in needles
+        return any(n in text for n in needles)
 
     if pgcode == "23505":
-        if "applied_change" in text:
+        if _hit("applied_change_proposal_uk", "applied_change"):
             return SnapshotStoreError(_CODE_ALREADY_APPLIED, "该提案已应用过。")
-        if "snapshot_one_latest" in text:
+        if _hit("snapshot_one_latest"):
             return SnapshotStoreError(_CODE_SNAPSHOT_CONFLICT,
                                       "并发创建快照，latest 唯一约束冲突，请重试。")
         return SnapshotStoreError(_CODE_INTERNAL_ERROR, "唯一约束冲突。",
-                                  details={"where": where})
+                                  details={"where": where, "constraint": constraint})
     if pgcode == "23503":
         return SnapshotStoreError(_CODE_INTERNAL_ERROR,
-                                  "引用完整性违约（用户归属不符）。",
-                                  details={"where": where})
+                                  "引用完整性违约（用户归属或版本不符）。",
+                                  details={"where": where, "constraint": constraint})
     if pgcode in ("40001", "40P01"):
         return SnapshotStoreError(_CODE_DEPENDENCY_UNAVAILABLE,
                                   "事务冲突或死锁，可重试。", retryable=True,
@@ -771,6 +808,24 @@ def _map_db_error(exc, where):
                                   details={"where": where})
     return SnapshotStoreError(_CODE_INTERNAL_ERROR, "快照存储内部错误。",
                               details={"where": where, "type": name})
+
+
+def _base_version(snapshot_id, version):
+    """base_version 的唯一构造入口。
+
+    为什么需要这个函数：`base_version` 的库级生成列在 proposal 表上
+    （`snapshot_id::text || ':' || snapshot_version::text`），snapshot 表没有同名列，
+    所以「快照维度」根本读不到库值，只能按同一规则构造。
+
+    M3 2026-11-07 审查 P1-1 指出：同一个格式原先在 create_snapshot / get_snapshot /
+    get_latest 三处各拼一次，与文件头自述「绝不在这里拼字符串」相反。现在三处统一
+    走这里，规则只存在一份；配合 migration 的
+    `proposal_snapshot_version_fk (snapshot_id, snapshot_version) -> snapshot(snapshot_id, version)`，
+    「应用层拼出来的值」与「库里生成列的值」不再靠巧合一致，而是被约束钉住。
+
+    改这个格式 = 同时改 migration 的生成列表达式，两处必须同形。
+    """
+    return "%s:%d" % (snapshot_id, int(version))
 
 
 def _iso(value):

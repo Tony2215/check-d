@@ -27,7 +27,8 @@ import os
 import sys
 import unittest
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.join(HERE, ".."))
 
 import snapshot_store as ss  # noqa: E402
 
@@ -131,7 +132,7 @@ class TestApplyProposal(unittest.TestCase):
 
     def test_already_applied_is_error_not_success(self):
         """已应用要报 ALREADY_APPLIED，不能当成功返回——重复写会污染结果。"""
-        store, ex = _store(replies=[[("applied", "snap-1", 2, "snap-1:2", None)]])
+        store, ex = _store(replies=[[("applied", "snap-1", 2, "snap-1:2", None, None, False, False)]])
         with self.assertRaises(ss.SnapshotStoreError) as ctx:
             store.apply_proposal("prop-1", "u1", "snap-1:2")
         self.assertEqual(ctx.exception.code, "ALREADY_APPLIED")
@@ -139,35 +140,42 @@ class TestApplyProposal(unittest.TestCase):
         self.assertEqual(ex.commits, 0)
 
     def test_version_mismatch_is_snapshot_conflict(self):
-        store, ex = _store(replies=[[("pending", "snap-1", 2, "snap-1:3", None)]])
+        store, ex = _store(replies=[[("pending", "snap-1", 2, "snap-1:3", None, None, False, False)]])
         with self.assertRaises(ss.SnapshotStoreError) as ctx:
             store.apply_proposal("prop-1", "u1", "snap-1:2")
         self.assertEqual(ctx.exception.code, "SNAPSHOT_CONFLICT")
         self.assertEqual(ex.rollbacks, 1)
 
     def test_expired_proposal_is_proposal_expired(self):
-        store, ex = _store(replies=[[("pending", "snap-1", 2, "snap-1:2", None, {"blocks": []})], [(True,)]])
+        store, ex = _store(replies=[
+            [("pending", "snap-1", 2, "snap-1:2", None, {"blocks": []}, True, False)]])
         with self.assertRaises(ss.SnapshotStoreError) as ctx:
             store.apply_proposal("prop-1", "u1", "snap-1:2")
         self.assertEqual(ctx.exception.code, "PROPOSAL_EXPIRED")
 
     def test_expiry_checked_by_database_not_client(self):
         """过期判据必须是库的 now()，不是客户端传的时间。"""
-        store, ex = _store(replies=[[("pending", "snap-1", 2, "snap-1:2", None, {"blocks": []})], [(False,)]])
+        store, ex = _store(replies=[
+            [("pending", "snap-1", 2, "snap-1:2", None, {"blocks": []}, False, False)]])
         store.apply_proposal("prop-1", "u1", "snap-1:2")
-        expiry_sql = ex.statements[1][0].lower()
-        self.assertIn("expires_at <= now()", expiry_sql)
+        head_sql = ex.statements[0][0].lower()
+        self.assertIn("expires_at <= now()", head_sql)
+        self.assertEqual(len([x for x in ex.statements if "expires_at <= now()" in x[0].lower()]), 1,
+                         "过期判定应随首条查询一次取回，不能再单发一条（M3 P2②）")
 
     def test_proposal_locks_row_for_update(self):
-        store, ex = _store(replies=[[("pending", "snap-1", 2, "snap-1:2", None, {"blocks": []})], [(False,)]])
+        store, ex = _store(replies=[
+            [("pending", "snap-1", 2, "snap-1:2", None, {"blocks": []}, False, False)]])
         store.apply_proposal("prop-1", "u1", "snap-1:2")
         lock_sql = ex.statements[0][0].lower()
         self.assertIn("for update", lock_sql)
+        self.assertIn("for update of p", lock_sql,
+                      "多 join 了 snapshot，锁必须显式限定在 proposal 行（锁序不能变）")
 
     def test_success_writes_applied_change_then_updates_status(self):
         store, ex = _store(replies=[
-            [("pending", "snap-1", 2, "snap-1:2", None, {"blocks": [1], "changes": [2]})],
-            [(False,)],
+            [("pending", "snap-1", 2, "snap-1:2", None,
+              {"blocks": [1], "changes": [2]}, False, False)],
             [],
             [],
         ])
@@ -176,14 +184,13 @@ class TestApplyProposal(unittest.TestCase):
         self.assertEqual(ex.commits, 1)
         self.assertEqual(ex.rollbacks, 0)
         kinds = [s[0].lower() for s in ex.statements]
-        self.assertIn("insert into checkd_demo.applied_change", kinds[2])
-        self.assertIn("update checkd_demo.proposal set status = 'applied'", kinds[3])
+        self.assertIn("insert into checkd_demo.applied_change", kinds[1])
+        self.assertIn("update checkd_demo.proposal set status = 'applied'", kinds[2])
 
     def test_missing_plan_refuses_instead_of_using_caller_input(self):
         """库里没有 plan 时必须拒，不能拿调用方的东西顶替（契约 L514）。"""
         store, ex = _store(replies=[
-            [("pending", "snap-1", 2, "snap-1:2", None)],   # 只有 5 列，没有 plan
-            [(False,)],
+            [("pending", "snap-1", 2, "snap-1:2", None, None, False, False)],  # plan 为 NULL
         ])
         with self.assertRaises(ss.SnapshotStoreError) as ctx:
             store.apply_proposal("prop-1", "u1", "snap-1:2")
@@ -197,8 +204,7 @@ class TestApplyProposal(unittest.TestCase):
         """写进 applied_change 的必须是库里的 plan，不是任何外部入参。"""
         saved = {"blocks": [{"task_id": "t_1"}], "changes": [], "unplanned_tasks": []}
         store, ex = _store(replies=[
-            [("pending", "snap-1", 2, "snap-1:2", None, saved)],
-            [(False,)],
+            [("pending", "snap-1", 2, "snap-1:2", None, saved, False, False)],
             [],
             [],
         ])
@@ -209,8 +215,7 @@ class TestApplyProposal(unittest.TestCase):
     def test_select_reads_plan_column(self):
         """apply 的 select 必须把 plan 一起取出来，否则上面两条都无从谈起。"""
         store, ex = _store(replies=[
-            [("pending", "snap-1", 2, "snap-1:2", None, {"blocks": []})],
-            [(False,)],
+            [("pending", "snap-1", 2, "snap-1:2", None, {"blocks": []}, False, False)],
             [],
             [],
         ])
@@ -319,6 +324,96 @@ class TestTransactionSemantics(unittest.TestCase):
             store.create_snapshot("u1", "2026-11-07", "2026-11-20", {})
         self.assertEqual(ex.commits, 0)
         self.assertGreaterEqual(ex.rollbacks, 1)
+
+
+
+class TestSnapshotTTLInStore(unittest.TestCase):
+    """P0-1：快照 TTL 是库里真实存的一列，必须在 store 层就判，不能指望上层记得判。
+
+    两个入口：
+      proposal_gate()  —— validate / request_approval 都从它取事实
+      apply_proposal() —— 唯一写路径，自己也要闸一遍（绕过 tools 直接调 store 也拦得住）
+    """
+
+    def test_proposal_gate_selects_snapshot_expiry(self):
+        row = ("prop-1", "u1", "snap-1", 2, "snap-1:2", "pending", "valid",
+               {"blocks": []}, None, None, False, True, "2026-11-08", "2026-11-10", "dg")
+        store, ex = _store(replies=[[row]])
+        gate = store.proposal_gate("prop-1", "u1")
+        sql = ex.statements[0][0].lower()
+        self.assertIn("s.expires_at <= now()", sql,
+                      "proposal_gate 必须把快照 TTL 一起判回来")
+        self.assertTrue(gate["snapshot_expired"])
+        self.assertFalse(gate["expired"], "两条 TTL 是独立字段，不能互相顶替")
+        self.assertEqual(gate["date_from"], "2026-11-08")
+
+    def test_apply_refuses_when_snapshot_expired(self):
+        store, ex = _store(replies=[
+            [("pending", "snap-1", 2, "snap-1:2", None, {"blocks": []}, False, True)]])
+        with self.assertRaises(ss.SnapshotStoreError) as ctx:
+            store.apply_proposal("prop-1", "u1", "snap-1:2")
+        self.assertEqual(ctx.exception.code, "SNAPSHOT_CONFLICT")
+        self.assertEqual(ex.commits, 0, "快照过期时不得提交任何写入")
+        self.assertEqual(ex.rollbacks, 1)
+
+    def test_apply_proposal_expiry_takes_precedence_over_snapshot(self):
+        """两个都过期报 PROPOSAL_EXPIRED（提案先死），顺序稳定才好断言。"""
+        store, ex = _store(replies=[
+            [("pending", "snap-1", 2, "snap-1:2", None, {"blocks": []}, True, True)]])
+        with self.assertRaises(ss.SnapshotStoreError) as ctx:
+            store.apply_proposal("prop-1", "u1", "snap-1:2")
+        self.assertEqual(ctx.exception.code, "PROPOSAL_EXPIRED")
+
+
+class TestConstraintNameMapping(unittest.TestCase):
+    """P2①：错误映射不能靠错误文案，要用 exc.diag.constraint_name。"""
+
+    class _Err(Exception):
+        def __init__(self, sqlstate, constraint=None, text="dup"):
+            super().__init__(text)
+            self.sqlstate = sqlstate
+
+            class D:
+                constraint_name = constraint
+            self.diag = D()
+
+    def test_uses_constraint_name_not_message_text(self):
+        # 文案里故意不含 applied_change 字样，只有结构化约束名能认出来
+        err = ss._map_db_error(
+            self._Err("23505", "applied_change_proposal_uk", "duplicate key value"), "x")
+        self.assertEqual(err.code, "ALREADY_APPLIED")
+
+    def test_message_wording_change_does_not_degrade_to_500(self):
+        err = ss._map_db_error(
+            self._Err("23505", "snapshot_one_latest", "重新表述过的错误文案"), "x")
+        self.assertEqual(err.code, "SNAPSHOT_CONFLICT",
+                         "驱动改措辞不该把 409 退化成 500")
+
+    def test_falls_back_to_text_when_diag_missing(self):
+        class NoDiag(Exception):
+            def __init__(self, sqlstate, text):
+                super().__init__(text)
+                self.sqlstate = sqlstate
+
+        err = ss._map_db_error(NoDiag("23505", 'duplicate key "snapshot_one_latest"'), "x")
+        self.assertEqual(err.code, "SNAPSHOT_CONFLICT")
+
+
+class TestBaseVersionSingleSource(unittest.TestCase):
+    """P1-1：base_version 的格式只许存在一个函数里。"""
+
+    def test_format_matches_generated_column(self):
+        self.assertEqual(ss._base_version("snap-1", 2), "snap-1:2")
+        self.assertEqual(ss._base_version("11111111-1111-1111-1111-111111111111", 7),
+                         "11111111-1111-1111-1111-111111111111:7")
+
+    def test_no_inline_format_left_in_module(self):
+        src = open(os.path.join(HERE, "..", "snapshot_store.py"), encoding="utf-8").read()
+        # 全文件这个格式只许出现一次（就是 _base_version 里那行）。
+        # 数出现次数，比"排除某几个函数"更难绕过。
+        hits = [ln.strip() for ln in src.splitlines() if '"%s:%d"' in ln]
+        self.assertEqual(len(hits), 1,
+                         "base_version 格式必须只存在一处，实际 %d 处：%s" % (len(hits), hits))
 
 
 if __name__ == "__main__":

@@ -121,3 +121,40 @@ BIND=0.0.0.0 CHECKD_DEMO_TOKEN=<口令> CHECKD_ADMIN_KEY=<管理口令> PYTHONUN
 - 不支持 Dart，M2 引擎**无法**部署到这里；`generate_schedule` 当前用的是 mock 调度器。
 - 单一实现、单一进程、串行可接受；无限流、无审计日志、无 WAF。
 - 演示数据仅隔离环境，不写 Production / Dev。
+
+## 八、快照库的两个身份（必须分开说，别混）
+
+`tools/m1-server` 接快照库时涉及**两个不同的数据库身份**，它们的权限完全不同，
+验收结论里混着写就是错的说法。
+
+| 身份 | 谁在用 | 权限 | 能干什么 |
+|---|---|---|---|
+| `postgres`（库所有者） | M0 在 Supabase SQL Editor 执行 migration | 超级权限，`revoke` 对它无效 | DDL、建表、改约束 |
+| `checkd_demo_app`（nologin 角色） | 应用运行时连接 | 只 `usage` + 四张表的 DML，**无** `create`/`delete`/`truncate` | 读写业务表，不能改结构 |
+
+三条容易说错的：
+
+1. **用 postgres 的 DSN 跑应用，等于最小权限没生效。** migration 里的 `revoke`/
+   `grant` 对一个库所有者角色不构成限制，它本来就能做任何事。这种情况下权限段是
+   **文档性约束**，不是运行时约束 —— 验收结论不得写「已按最小权限运行」。
+2. **preflight 报「应用角色有权限」≠「应用真的用该角色连」。** 前者只证明权限位存在，
+   后者要拿 `checkd_demo_app` 的 DSN 真连一次才能证明。两件事分开写。
+3. **要真验最小权限**，得给 `checkd_demo_app` 开 login + 密码，用它的 DSN 跑一遍
+   preflight（`CHECKD_DEMO_DSN` 换成该角色）。这一步需要 M0 单独授权，
+   因为要新增一个有 login 的角色。
+
+## 九、preflight 的只读边界（2026-11-07 事故后定稿）
+
+`preflight_snapshot_db.py` **默认只读**：连接层 `default_transaction_read_only=on`、
+语句守卫只放行 select/with/show/explain、连上后真去 `create temp table` 验证写被拒
+（SQLSTATE 25006）。
+
+写入型行为测试（唯一索引 / 复合 FK / TTL 实拍）走另一条命令，且必须显式授权：
+
+```
+python tools/m1-server/preflight_snapshot_db.py --behavior-tests --i-have-m0-approval
+python tools/m1-server/preflight_snapshot_db.py --apply          --i-have-m0-approval
+```
+
+缺 `--i-have-m0-approval` 一律 `REFUSED` + exit 3。**不要**用「文件名/参数名看起来是只读」
+当证据 —— 2026-11-07 就出过一版默认路径会 INSERT/DELETE 的脚本，注释写着只读。
