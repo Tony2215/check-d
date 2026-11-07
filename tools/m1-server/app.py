@@ -90,6 +90,55 @@ _ENGINE = {"pid": None, "error": None}
 # 调用却不经过它，而外部看不出来。所以这个标识必须对外可见，且不许写死成 REAL。
 ENGINE_WIRED = os.environ.get("CHECKD_ENGINE_WIRED", "0") == "1"
 
+# 快照库接线开关（三态，见 _snapshot_state）。
+#
+#   off（默认）：走现有 mock 路径，行为与 2026-11-07 之前完全一致
+#   on  + DSN 可用：工具走真快照
+#   on  + DSN 缺失/连不上：503 fail-closed，**绝不回退 mock**
+#
+# 为什么不把默认设成 on：线上当前没有 DSN，设 on 会让能演示的链路全部 503。
+# M0 2026-11-07T03:36:48Z 工单 §三 要求的是「开了就必须真」，不是「关着也要 503」。
+SNAPSHOT_MODE = os.environ.get("CHECKD_SNAPSHOT_MODE", "off").lower()
+DEMO_DSN = os.environ.get("CHECKD_DEMO_DSN", "")
+
+# 需要快照支撑的工具。只有这四个在 mode=on 时受 gate 约束，其余五个不受影响。
+SNAPSHOT_TOOLS = frozenset({
+    "generate_schedule", "validate_schedule",
+    "request_approval", "apply_approved_changes",
+})
+
+_store = {"instance": None, "error": None}
+
+
+def _snapshot_store():
+    """懒加载快照存储。mode=off 或没 DSN 时返回 None，不抛。"""
+    if SNAPSHOT_MODE != "on" or not DEMO_DSN:
+        return None
+    if _store["instance"] is not None:
+        return _store["instance"]
+    try:
+        import snapshot_store
+        st = snapshot_store.SnapshotStore(dsn=DEMO_DSN)
+        st.open()
+        if not st.health():
+            raise RuntimeError("pool_open_but_unhealthy")
+        _store["instance"] = st
+        _store["error"] = None
+        return st
+    except Exception as e:                                   # noqa: BLE001
+        # 记住失败原因，但不把 DSN 或异常原文带回公网（可能含连接串）。
+        _store["error"] = type(e).__name__
+        return None
+
+
+def _snapshot_state():
+    """给 /health 与 /diag 的只读状态。不主动探测时返回静态值。"""
+    if SNAPSHOT_MODE != "on":
+        return {"mode": SNAPSHOT_MODE, "dsn_configured": bool(DEMO_DSN), "ready": False}
+    st = _snapshot_store()
+    return {"mode": SNAPSHOT_MODE, "dsn_configured": True,
+            "ready": st is not None, "error": _store.get("error")}
+
 _RATE = {}              # (ip, bucket) -> deque[monotonic ts]
 _RATE_LOCK = threading.Lock()
 
@@ -224,6 +273,15 @@ def _env_diag():
                               if k.startswith("CHECKD_") or k in ("BIND", "PORT", "PATH"))
     # 6) M2 引擎存活状态（只走回环）。
     diag["engine"] = _engine_status()
+    # 快照库：mode=on 时才真去连（这里被低频访问，连一次可以接受）。
+    diag["snapshot"] = _snapshot_state()
+    # explanations 过滤统计：被剔除多少条、有没有未登记的码。
+    # 只报码名与条数，不报被剔除的内容。
+    try:
+        import explanations_filter
+        diag["explanations_filter"] = explanations_filter.STATS.snapshot()
+    except Exception:                                        # noqa: BLE001
+        diag["explanations_filter"] = {"error": "unavailable"}
     return diag
 
 
@@ -255,16 +313,62 @@ def _snapshot_counts():
     }
 
 
+def _sanitize_explanations(body):
+    """把响应里的 explanations 过公开白名单（契约 L316-318）。
+
+    只处理确实带 explanations 数组的层，找不到就什么都不做——
+    过滤层出问题不能影响主流程，但也不能假装过滤过。
+    """
+    try:
+        import explanations_filter
+    except Exception:                                        # noqa: BLE001
+        sys.stderr.write("explanations_filter unavailable; skipped\n")
+        return
+    if not isinstance(body, dict):
+        return
+    layers = [body]
+    for key in ("data", "result"):
+        inner = body.get(key)
+        if isinstance(inner, dict):
+            layers.append(inner)
+    for layer in layers:
+        if isinstance(layer.get("explanations"), list):
+            layer["explanations"] = explanations_filter.filter_explanations(
+                layer["explanations"])
+
+
 def _call(name, args):
     """调用一个工具，返回 (http_status, body, evidence_entry)。"""
     started = time.time()
     trace = uuid.uuid4().hex[:16]
     ok = False
     code = None
+
+    # 快照闸：仅在 CHECKD_SNAPSHOT_MODE=on 时生效。
+    # 开了就必须真——库不可用一律 503，绝不悄悄回退 mock（M0 §三）。
+    # 关着时（默认）本分支直接跳过，行为与接线前完全一致。
+    if SNAPSHOT_MODE == "on" and name in SNAPSHOT_TOOLS and _snapshot_store() is None:
+        body = errs.to_envelope(
+            "DEPENDENCY_UNAVAILABLE",
+            "快照库不可用，本次调用未执行。",
+            request_id=(args or {}).get("request_id"), trace_id=trace)
+        entry = {"ts": _now(), "trace_id": trace, "tool": name, "arguments": args,
+                 "ok": False, "error_code": "DEPENDENCY_UNAVAILABLE", "duration_ms": 0,
+                 "gate": "snapshot_not_ready"}
+        with _LOCK:
+            _STATS["calls"] += 1
+            _STATS["errors"] += 1
+            _EVIDENCE.append(entry)
+        return 503, body, entry
+
     try:
         result = mock.call_tool(name, args, DEMO_USER_TOKEN)
         body = result.get("structuredContent") or {}
         ok = not result.get("isError", False)
+        # 引擎/工具的 explanations 一律过公开白名单（契约 L316-318）。
+        # 非 dict 或没有 explanations 时原样返回，不因过滤层出错影响主流程。
+        if ok:
+            _sanitize_explanations(body)
         if ok:
             status = 200
         else:
@@ -538,6 +642,10 @@ class Handler(BaseHTTPRequestHandler):
                 # 当前恒为 MOCK（工具层未接线），引擎进程存活另见 /diag 的 engine.up。
                 "scheduler_mode": _scheduler_mode(),
                 "engine_enabled": ENGINE_ENABLED,
+                # 快照库接线状态。只报静态配置事实，不在这里连库——
+                # /health 被高频探活，不能因为它去 ping 数据库。
+                "snapshot_mode": SNAPSHOT_MODE,
+                "snapshot_dsn_configured": bool(DEMO_DSN),
             })
             return
 
