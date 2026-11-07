@@ -381,6 +381,41 @@ class SnapshotStore:
             "superseded": row[8] is not None,
         }
 
+    def get_snapshot_payload(self, snapshot_id, user_id):
+        """取快照本体 + 归属与范围。validate 需要用快照里的 ext/prefs 重算摘要。
+
+        为什么不复用 get_snapshot：那条查询刻意不取 payload（body 可能很大，
+        列表类路径不需要它）。这里单独一条，避免把大字段带进所有调用。
+        """
+        try:
+            with self._ex.transaction() as conn:
+                row = conn.execute(
+                    "select s.snapshot_id, s.version, s.user_id, s.date_from, s.date_to, "
+                    "       s.payload, s.payload_digest, s.payload_bytes, s.expires_at, "
+                    "       s.superseded_at "
+                    "  from checkd_demo.snapshot s "
+                    " where s.snapshot_id = %s and s.user_id = %s",
+                    (snapshot_id, user_id),
+                ).fetchone()
+        except SnapshotStoreError:
+            raise
+        except Exception as e:                       # noqa: BLE001
+            raise _map_db_error(e, "get_snapshot_payload")
+        if row is None:
+            raise SnapshotStoreError(_CODE_NOT_FOUND, "快照不存在或不属于当前用户。")
+        return {
+            "snapshot_id": str(row[0]),
+            "version": int(row[1]),
+            "user_id": row[2],
+            "date_from": _iso_date(row[3]),
+            "date_to": _iso_date(row[4]),
+            "payload": row[5],
+            "payload_digest": row[6],
+            "payload_bytes": int(row[7]),
+            "expires_at": _iso(row[8]),
+            "superseded": row[9] is not None,
+        }
+
     def get_latest(self, user_id, date_from, date_to):
         try:
             with self._ex.transaction() as conn:
@@ -471,6 +506,105 @@ class SnapshotStore:
             "status": row[5],
             "expires_at": _iso(row[6]),
             "applied_at": _iso(row[7]),
+        }
+
+    def proposal_gate(self, proposal_id, user_id):
+        """一次查询取齐「能不能进下一步」所需的全部事实，**过期由库判**。
+
+        为什么要单独一个方法，而不是上层拿 get_proposal 自己比时间：
+        容器时钟与本机时钟都不可信，`expires_at` 是库 `now()` 写的，
+        比较也必须用库的 `now()`。差几秒就可能是「本地没过期、库里已过期」。
+        """
+        _require_text(user_id, "user_id")
+        try:
+            with self._ex.transaction() as conn:
+                row = conn.execute(
+                    "select p.proposal_id, p.user_id, p.snapshot_id, p.snapshot_version, "
+                    "       p.base_version, p.status, p.validation_status, p.plan, "
+                    "       p.expires_at, p.applied_at, "
+                    "       (p.expires_at <= now()) as expired, "
+                    "       s.date_from, s.date_to, s.payload_digest "
+                    "  from checkd_demo.proposal p "
+                    "  join checkd_demo.snapshot s "
+                    "    on s.snapshot_id = p.snapshot_id and s.user_id = p.user_id "
+                    " where p.proposal_id = %s and p.user_id = %s",
+                    (proposal_id, user_id),
+                ).fetchone()
+        except SnapshotStoreError:
+            raise
+        except Exception as e:                       # noqa: BLE001
+            raise _map_db_error(e, "proposal_gate")
+        if row is None:
+            raise SnapshotStoreError(_CODE_NOT_FOUND, "提案不存在或不属于当前用户。")
+        return {
+            "proposal_id": str(row[0]),
+            "user_id": row[1],
+            "snapshot_id": str(row[2]),
+            "snapshot_version": int(row[3]),
+            "base_version": row[4],
+            "status": row[5],
+            "validation_status": row[6],
+            "plan": row[7],
+            "expires_at": _iso(row[8]),
+            "applied_at": _iso(row[9]),
+            "expired": bool(row[10]),
+            "date_from": _iso_date(row[11]),
+            "date_to": _iso_date(row[12]),
+            "snapshot_payload_digest": row[13],
+        }
+
+    def set_validation(self, proposal_id, user_id, validation_status):
+        """落校验结论。
+
+        只动 `validation_status`，**不动 `status`**：库里 status 的闭集是
+        `pending/applied/rejected/expired`，没有契约 §5.7 的 `pending_approval`，
+        往库里写契约值会直接撞 CHECK 约束。出参映射在 `proposal_assembly.contract_status`，
+        两边各管一层，不互相冒充。
+        """
+        if validation_status not in ("unvalidated", "valid", "invalid"):
+            raise SnapshotStoreError(_CODE_INVALID_ARGUMENT,
+                                     "validation_status 取值非法。")
+        _require_text(user_id, "user_id")
+        try:
+            with self._ex.transaction() as conn:
+                row = conn.execute(
+                    "update checkd_demo.proposal set validation_status = %s "
+                    " where proposal_id = %s and user_id = %s "
+                    "returning proposal_id",
+                    (validation_status, proposal_id, user_id),
+                ).fetchone()
+        except SnapshotStoreError:
+            raise
+        except Exception as e:                       # noqa: BLE001
+            raise _map_db_error(e, "set_validation")
+        if row is None:
+            raise SnapshotStoreError(_CODE_NOT_FOUND, "提案不存在或不属于当前用户。")
+        return True
+
+    def get_applied_change(self, proposal_id, user_id):
+        """读回 apply 写下的结果，用于写入后回读核验（readback）。"""
+        _require_text(user_id, "user_id")
+        try:
+            with self._ex.transaction() as conn:
+                row = conn.execute(
+                    "select apply_id, proposal_id, user_id, snapshot_id, applied_at, result "
+                    "  from checkd_demo.applied_change "
+                    " where proposal_id = %s and user_id = %s",
+                    (proposal_id, user_id),
+                ).fetchone()
+        except SnapshotStoreError:
+            raise
+        except Exception as e:                       # noqa: BLE001
+            raise _map_db_error(e, "get_applied_change")
+        if row is None:
+            raise SnapshotStoreError(_CODE_NOT_FOUND, "该提案没有已应用的变更记录。")
+        return {
+            "apply_id": str(row[0]),
+            "proposal_id": str(row[1]),
+            "user_id": row[2],
+            "snapshot_id": str(row[3]),
+            "applied_at": _iso(row[4]),
+            "result": row[5],
         }
 
     # ---------- apply ----------

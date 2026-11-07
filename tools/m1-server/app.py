@@ -367,6 +367,85 @@ def _sanitize_explanations(body):
                 layer["explanations"])
 
 
+def _detail_list(details):
+    """把各种 details 形状收成契约要求的数组。
+
+    `SnapshotStoreError.details` 是 dict，`ToolError.details` 是 list，
+    而 `errors.to_envelope` 只接受 list —— 直接传 dict 会 TypeError，
+    于是一次参数错误会变成 500，把可诊断的失败伪装成服务端故障。
+    """
+    if not details:
+        return None
+    if isinstance(details, list):
+        return details
+    if isinstance(details, dict):
+        return [{"field": str(k), "reason": str(v)[:200]} for k, v in details.items()]
+    return None
+
+
+def _snapshot_dispatch(name, args, trace, started):
+    """mode=on 时的分派：四个快照工具走持久快照，其余工具仍走 mock。
+
+    刻意独立成函数、且异常在这里就地转信封 —— `_call` 那段 try/except 是
+    mock 路径的，两套错误面混在一起会让「库连不上」被记成「工具崩溃」。
+    """
+    st = _snapshot_store()
+    ok = False
+    code = None
+
+    if st is None:                      # 双保险：调用方前面已拦过一次
+        status = 503
+        code = "DEPENDENCY_UNAVAILABLE"
+        body = errs.to_envelope(
+            code, "快照库不可用，本次调用未执行。",
+            request_id=(args or {}).get("request_id"), trace_id=trace)
+    else:
+        try:
+            import snapshot_tools
+            user = mock.user_from_token(DEMO_USER_TOKEN)
+            body = snapshot_tools.SnapshotTools(st).call(name, args, user)
+            _sanitize_explanations(body)
+            if not body.get("trace_id"):
+                body["trace_id"] = trace
+            status = 200
+            ok = True
+        except Exception as exc:                             # noqa: BLE001
+            code = getattr(exc, "code", None)
+            if code and errs.is_known_code(code):
+                status = errs.http_status(code)
+                body = errs.to_envelope(
+                    code, getattr(exc, "message", "") or "请求未能完成。",
+                    request_id=(args or {}).get("request_id"), trace_id=trace,
+                    details=_detail_list(getattr(exc, "details", None)))
+            else:
+                sys.stderr.write("snapshot tool %s crashed:\n%s\n"
+                                 % (name, traceback.format_exc()))
+                code = "INTERNAL_ERROR"
+                status = 500
+                body = errs.to_envelope(
+                    code, "服务端内部错误，请稍后重试并附 trace_id。",
+                    request_id=(args or {}).get("request_id"), trace_id=trace)
+
+    entry = {
+        "ts": _now(),
+        "trace_id": trace,
+        "tool": name,
+        "arguments": args,
+        "ok": ok,
+        "error_code": code,
+        "duration_ms": int((time.time() - started) * 1000),
+        "path": "snapshot",
+    }
+    with _LOCK:
+        _STATS["calls"] += 1
+        if not ok:
+            _STATS["errors"] += 1
+        _EVIDENCE.append(entry)
+        if len(_EVIDENCE) > _EVIDENCE_CAP:
+            del _EVIDENCE[:len(_EVIDENCE) - _EVIDENCE_CAP]
+    return status, body, entry
+
+
 def _call(name, args):
     """调用一个工具，返回 (http_status, body, evidence_entry)。"""
     started = time.time()
@@ -390,6 +469,11 @@ def _call(name, args):
             _STATS["errors"] += 1
             _EVIDENCE.append(entry)
         return 503, body, entry
+
+    # mode=on 时四个快照工具改走持久快照（snapshot_tools）；其余工具仍走 mock，
+    # 所以 get_approval_status / list_tasks 这些读写不受影响，演示链路不会整条断。
+    if SNAPSHOT_MODE == "on" and name in SNAPSHOT_TOOLS:
+        return _snapshot_dispatch(name, args, trace, started)
 
     try:
         result = mock.call_tool(name, args, DEMO_USER_TOKEN)
