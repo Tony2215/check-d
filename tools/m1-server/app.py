@@ -212,26 +212,43 @@ def _env_diag():
     diag["binaries"] = {b: shutil.which(b) for b in binaries}
     # 关键版本号：Dart 3 的语法（switch 表达式等）在 Dart 2 上编不过，
     # 这是「引擎能不能在本容器跑」的第一判据，必须报出来。
+    #
+    # 并发跑 + 收紧超时。原来串行 timeout=25，实测 /diag 要 29 秒——
+    # 多数客户端默认 30s 就断，等于诊断端点自己先超时，失去诊断意义。
+    # Dart VM 冷启动确实要几秒，所以给 8s 而不是 2s；两个并发，总耗时≈最慢那个。
     versions = {}
-    for b in ("dart", "flutter"):
-        if not diag["binaries"].get(b):
-            continue
-        for args in ((b, "--version"),):
-            try:
-                pv = subprocess.run(list(args), capture_output=True, text=True, timeout=25)
-                versions[b] = ((pv.stdout or "") + (pv.stderr or "")).strip().splitlines()[:2]
-            except Exception as e:                           # noqa: BLE001
-                versions[b] = [type(e).__name__]
-    diag["versions"] = versions
+    vjobs = [b for b in ("dart", "flutter") if diag["binaries"].get(b)]
+
+    def _ver(b):
+        try:
+            pv = subprocess.run([b, "--version"], capture_output=True,
+                                text=True, timeout=8)
+            versions[b] = ((pv.stdout or "") + (pv.stderr or "")).strip().splitlines()[:2]
+        except Exception as e:                               # noqa: BLE001
+            versions[b] = [type(e).__name__]
+
+    vthreads = [threading.Thread(target=_ver, args=(b,), daemon=True) for b in vjobs]
+
+    # spawn 探测跟着同一批并发跑：它也是一次 subprocess，串在后面就是白等 5 秒。
     spawn = {"ok": False}
-    try:
-        p = subprocess.run([sys.executable, "-c", "print('spawn-ok')"],
-                           capture_output=True, text=True, timeout=10)
-        spawn = {"ok": p.returncode == 0,
-                 "stdout": (p.stdout or "").strip()[:40],
-                 "returncode": p.returncode}
-    except Exception as e:                                   # noqa: BLE001
-        spawn = {"ok": False, "error": type(e).__name__}
+
+    def _spawn_probe():
+        try:
+            p = subprocess.run([sys.executable, "-c", "print('spawn-ok')"],
+                               capture_output=True, text=True, timeout=5)
+            spawn.update({"ok": p.returncode == 0,
+                          "stdout": (p.stdout or "").strip()[:40],
+                          "returncode": p.returncode})
+        except Exception as e:                               # noqa: BLE001
+            spawn.update({"ok": False, "error": type(e).__name__})
+
+    vthreads.append(threading.Thread(target=_spawn_probe, daemon=True))
+    for t in vthreads:
+        t.start()
+    vdeadline = time.time() + 9.0
+    for t in vthreads:
+        t.join(max(0.05, vdeadline - time.time()))
+    diag["versions"] = versions
     diag["subprocess"] = spawn
 
     # 2) 回环端口能否监听（第二个进程要靠它把引擎挂起来）。
@@ -248,16 +265,29 @@ def _env_diag():
     diag["loopback_listen"] = loop
 
     # 3) 出站能不能连出去（决定构建期能否拉依赖；只测连接，不发数据）。
+    # 出站探测：并发跑，总耗时≈最慢一项而不是累加。
+    # 串行时 6 个目标 × 4s 超时 ≈ 24s，加引擎探测实测 /diag 要 31s——
+    # 多数客户端默认 30s 超时，等于诊断端点自己先超时，失去意义。
     egress = {}
-    for host, port in (("1.1.1.1", 443), ("pypi.org", 443),
-                       ("pub.dev", 443), ("storage.googleapis.com", 443),
-                       ("raw.githubusercontent.com", 443), ("github.com", 443)):
+    targets = (("1.1.1.1", 443), ("pypi.org", 443),
+               ("pub.dev", 443), ("storage.googleapis.com", 443),
+               ("raw.githubusercontent.com", 443), ("github.com", 443))
+
+    def _probe(host, port):
+        key = "%s:%d" % (host, port)
         try:
             s = socket.create_connection((host, port), timeout=4)
-            egress["%s:%d" % (host, port)] = True
             s.close()
+            egress[key] = True
         except Exception as e:                               # noqa: BLE001
-            egress["%s:%d" % (host, port)] = type(e).__name__
+            egress[key] = type(e).__name__
+
+    workers = [threading.Thread(target=_probe, args=t, daemon=True) for t in targets]
+    for w in workers:
+        w.start()
+    deadline = time.time() + 5.0
+    for w in workers:
+        w.join(max(0.05, deadline - time.time()))
     diag["egress"] = egress
 
     # 4) 工作目录是否可写（引擎二进制要落盘）。
