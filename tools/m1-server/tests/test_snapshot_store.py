@@ -416,5 +416,41 @@ class TestBaseVersionSingleSource(unittest.TestCase):
                          "base_version 格式必须只存在一处，实际 %d 处：%s" % (len(hits), hits))
 
 
+class TestTTLContract(unittest.TestCase):
+    """契约 L344-345 / L423：Proposal 固定有效 30 分钟，服务端不得延长。
+
+    旧默认 600 s 把契约的 30 分钟砍成 10 分钟，且是「悄悄砍」——库里写进去的
+    expires_at 比契约允许的早 20 分钟，调用方按契约算的时间再来会拿到
+    PROPOSAL_EXPIRED。这类参数默认值没有任何测试盯着，改错了不会红，所以在这里钉住。
+    """
+
+    CONTRACT_PROPOSAL_TTL = 30 * 60
+
+    def test_default_proposal_ttl_is_contract_30_minutes(self):
+        store, _ = _store()
+        self.assertEqual(store.proposal_ttl, self.CONTRACT_PROPOSAL_TTL,
+                         "契约写死 30 分钟；改这个值必须先改契约")
+
+    def test_snapshot_ttl_not_shorter_than_proposal_ttl(self):
+        """快照活得比提案短 = 契约给的权利被自家数据驳回。
+
+        提案在 30 分钟有效期内，但绑定的快照 15 分钟就过期 → validate /
+        request_approval / apply 全返回 SNAPSHOT_CONFLICT，用户拿着合规提案却走不下去。
+        """
+        store, _ = _store()
+        self.assertGreaterEqual(store.snapshot_ttl, store.proposal_ttl,
+                                "快照 TTL 必须 >= 提案 TTL，否则 TTL 内提案不可用")
+
+    def test_create_proposal_passes_contract_ttl_to_sql(self):
+        """默认值要真的进到 SQL 参数里，不能只停在对象属性上。"""
+        store, ex = _store(replies=[[("p-1", "snap-1:1", "pending",
+                                     "2026-11-07T12:30:00+08:00",
+                                     "2026-11-07T12:00:00+08:00")]])
+        store.create_proposal("u1", "snap-1", 1, {"blocks": [], "changes": []})
+        sql, params = ex.statements[-1]
+        self.assertIn("now() + make_interval", sql)
+        self.assertIn(self.CONTRACT_PROPOSAL_TTL, params)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

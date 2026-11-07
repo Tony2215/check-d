@@ -264,7 +264,20 @@ class _RecordingCursor:
 
 class SnapshotStore:
     def __init__(self, dsn=None, executor=None,
-                 snapshot_ttl_seconds=900, proposal_ttl_seconds=600):
+                 snapshot_ttl_seconds=1800, proposal_ttl_seconds=1800):
+        """TTL 默认值按契约定死，不做成可配置。
+
+        契约原文（blob 9579be9e，L344-345）：「Proposal 自 `generated_at` 起固定有效
+        30 分钟；服务端不得接受客户端指定或延长该 TTL」，L423 也是「TTL 30 分钟」。
+        旧默认 600 s（10 分钟）是早期遗留，等于把契约的 30 分钟砍成 10 分钟——库里
+        写进去的 `expires_at` 会比契约允许的提前 20 分钟到期，调用方按契约算的时间
+        再来 validate 就会拿到 PROPOSAL_EXPIRED。现已对齐 1800 s。
+
+        快照 TTL 必须 >= 提案 TTL，否则会出现自相矛盾的窗口：提案还在 30 分钟有效期内，
+        它绑定的快照却已过期，validate/request_approval/apply 三处都会返回
+        SNAPSHOT_CONFLICT —— 契约给的权利被自家数据驳回。故两者同取 1800 s，
+        让快照至少活得和提案一样久。
+        """
         self._ex = executor if executor is not None else PgExecutor(dsn or os.environ.get("CHECKD_DEMO_DSN", ""))
         self.snapshot_ttl = int(snapshot_ttl_seconds)
         self.proposal_ttl = int(proposal_ttl_seconds)
@@ -551,8 +564,10 @@ class SnapshotStore:
             "expired": bool(row[10]),
             # P0-1（M3 2026-11-07 审查）：快照自己的 TTL。
             # 原先只判 p.expires_at，snapshot.expires_at 存了却从没被读过 ——
-            # 默认 proposal TTL 600s < snapshot TTL 900s，所以「提案先过期」掩盖了这个洞；
+            # 当时默认 proposal TTL 600s < snapshot TTL 900s，所以「提案先过期」掩盖了这个洞；
             # 一旦把 snapshot TTL 调短，就会出现「拿过期快照 validate/apply」。
+            # 现两者同取 1800 s（见 __init__ 说明），但这个字段仍必须独立判、
+            # 不能靠「提案没过期」推论快照没过期。
             "snapshot_expired": bool(row[11]),
             "date_from": _iso_date(row[12]),
             "date_to": _iso_date(row[13]),

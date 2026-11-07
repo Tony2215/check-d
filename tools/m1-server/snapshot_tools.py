@@ -396,7 +396,8 @@ def _parse_date(value):
 def _proposal_ttl(m):
     """提案有效期。契约 §5.7 写死 30 分钟（L336-338），不读环境变量。
 
-    库里 `proposal_ttl` 默认 600 s 是历史遗留（已交 AUTO-INBOX 待改），
+    库里 `proposal_ttl` 已随 `SnapshotStore` 默认值对齐 1800 s（旧值 600 s 是历史遗留，
+    会让库里的 expires_at 比契约允许的提前 20 分钟到期），
     这里按契约取 30 分钟，且不做成可配置 —— 契约原文是
     「服务端不得接受客户端指定或延长该 TTL」，做成 env 就等于给了延长口子。
     """

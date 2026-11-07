@@ -369,8 +369,9 @@ class TestSnapshotTTL(_Base):
     """P0-1（M3 2026-11-07 审查）：快照 TTL 没接入任何判定路径。
 
     原先 validate / request_approval / apply 三条路都只看 proposal.expires_at，
-    snapshot.expires_at 存了却从没被读过。默认 proposal TTL(600s) < snapshot TTL(900s)，
+    snapshot.expires_at 存了却从没被读过。当时默认 proposal TTL(600s) < snapshot TTL(900s)，
     所以正常流程永远掩盖它；一旦把 snapshot TTL 调短，就能拿过期快照照样校验、审批、apply。
+    （两处默认现已改为 1800/1800，此处仍显式置 expired 位，不依赖 TTL 大小关系。）
 
     这里把三个入口分别钉住，并额外证明「proposal 没过期也一样被拦」——
     否则可能只是 proposal 过期先报，测试假绿。
