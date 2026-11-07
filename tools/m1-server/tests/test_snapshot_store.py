@@ -1,0 +1,250 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""snapshot_store 逻辑单测（无库环境）。
+
+## 这组测试能证明什么、不能证明什么
+
+能证明：
+- 发给库的语句文本与参数正确（单语句发号、无 select max+1、supersede 在 insert 之前）
+- 事务边界正确（成功提交、失败回滚）
+- 错误映射正确（23505/23503/连接类 → 契约闭集内的码，不新造码）
+- 入参校验与用户隔离（别人的 id 一律 NOT_FOUND，不回 403）
+
+**不能证明**：
+- PostgreSQL 是否接受这些 SQL
+- 唯一索引/复合外键在真实并发下是否真的拦住
+- 持久化是否真的落盘
+
+所以本文件全绿时，真实持久化仍标 BLOCKED（M0 §一.4）。
+层级标注：LOCAL-LOGIC（非持久化）。
+
+跑法：
+    cd work/repo/check-d
+    python -m unittest discover -s tools/m1-server/tests -v
+"""
+
+import os
+import sys
+import unittest
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+
+import snapshot_store as ss  # noqa: E402
+
+
+def _store(replies=None, fail_with=None):
+    ex = ss.RecordingExecutor(replies=replies, fail_with=fail_with)
+    return ss.SnapshotStore(executor=ex), ex
+
+
+class TestPayloadDigest(unittest.TestCase):
+    def test_digest_ignores_key_order(self):
+        """规范化后键序无关，否则同一份数据换个写法就是另一个摘要。"""
+        a = {"b": 1, "a": 2}
+        b = {"a": 2, "b": 1}
+        da, na = ss.payload_digest(a)
+        db, nb = ss.payload_digest(b)
+        self.assertEqual(da, db)
+        self.assertEqual(na, nb)
+
+    def test_digest_differs_on_value(self):
+        da, _ = ss.payload_digest({"a": 1})
+        db, _ = ss.payload_digest({"a": 2})
+        self.assertNotEqual(da, db)
+
+    def test_payload_bytes_is_utf8_length(self):
+        _, n = ss.payload_digest({"k": "中文"})
+        self.assertEqual(n, len('{"k":"中文"}'.encode("utf-8")))
+
+
+class TestCreateSnapshot(unittest.TestCase):
+    def test_version_sql_is_single_statement_no_select_max(self):
+        """发号必须是单语句 ON CONFLICT，禁止 select max+1。"""
+        store, ex = _store(replies=[[(1,)], [(None,)], [("uuid-1", "2026-11-07T12:00:00+08:00")]])
+        store.create_snapshot("u1", "2026-11-07", "2026-11-20", {"tasks": []})
+        first_sql = ex.statements[0][0].lower()
+        self.assertIn("on conflict", first_sql)
+        self.assertIn("returning next_version - 1", first_sql)
+        self.assertNotIn("max(", first_sql)
+        self.assertNotIn("max (", first_sql)
+
+    def test_supersede_runs_before_insert(self):
+        """顺序必须是：发号 → 旧 latest 置 superseded → 插新行。顺序错了会同时存在两个 latest。"""
+        store, ex = _store(replies=[[(1,)], [(None,)], [("uuid-1", "2026-11-07T12:00:00+08:00")]])
+        store.create_snapshot("u1", "2026-11-07", "2026-11-20", {"tasks": []})
+        s0, s1, s2 = [x[0].lower() for x in ex.statements[:3]]
+        self.assertIn("snapshot_seq", s0)
+        self.assertIn("update checkd_demo.snapshot", s1)
+        self.assertIn("superseded_at = now()", s1)
+        self.assertIn("insert into checkd_demo.snapshot", s2)
+
+    def test_ttl_passed_as_seconds_not_timestamp(self):
+        """expires_at 由库 now() 算，客户端只传秒数——不采信客户端时钟。"""
+        store, ex = _store(replies=[[(1,)], [(None,)], [("uuid-1", "2026-11-07T12:00:00+08:00")]])
+        store.create_snapshot("u1", "2026-11-07", "2026-11-20", {"a": 1})
+        insert_sql, insert_params = ex.statements[2]
+        self.assertIn("now() + make_interval", insert_sql)
+        self.assertIn(store.snapshot_ttl, insert_params)
+
+    def test_rejects_reversed_date_range(self):
+        store, ex = _store()
+        with self.assertRaises(ss.SnapshotStoreError) as ctx:
+            store.create_snapshot("u1", "2026-11-20", "2026-11-07", {})
+        self.assertEqual(ctx.exception.code, "INVALID_ARGUMENT")
+        self.assertEqual(ex.statements, [], "参数非法时不该打库")
+
+    def test_rejects_empty_user(self):
+        store, ex = _store()
+        with self.assertRaises(ss.SnapshotStoreError) as ctx:
+            store.create_snapshot("  ", "2026-11-07", "2026-11-20", {})
+        self.assertEqual(ctx.exception.code, "INVALID_ARGUMENT")
+        self.assertEqual(ex.statements, [])
+
+    def test_returns_base_version_from_snapshot_and_version(self):
+        store, ex = _store(replies=[[(3,)], [(None,)], [("snap-abc", "2026-11-07T12:00:00+08:00")]])
+        out = store.create_snapshot("u1", "2026-11-07", "2026-11-20", {"a": 1})
+        self.assertEqual(out["version"], 3)
+        self.assertEqual(out["base_version"], "snap-abc:3")
+
+
+class TestUserIsolation(unittest.TestCase):
+    def test_other_users_snapshot_is_not_found_not_forbidden(self):
+        """别人的 id 一律 404。回 403 等于确认"这个 id 存在"，是信息泄露。"""
+        store, ex = _store(replies=[[]])
+        with self.assertRaises(ss.SnapshotStoreError) as ctx:
+            store.get_snapshot("snap-x", "someone-else")
+        self.assertEqual(ctx.exception.code, "NOT_FOUND")
+
+    def test_query_filters_by_user_id(self):
+        store, ex = _store(replies=[[]])
+        with self.assertRaises(ss.SnapshotStoreError):
+            store.get_snapshot("snap-x", "u2")
+        sql, params = ex.statements[0]
+        self.assertIn("user_id = %s", sql)
+        self.assertIn("u2", params)
+
+
+class TestApplyProposal(unittest.TestCase):
+    def _apply(self, replies, base_version="snap-1:2"):
+        store, ex = _store(replies=replies)
+        return store, ex, store.apply_proposal("prop-1", "u1", base_version, {"ok": True})
+
+    def test_already_applied_is_error_not_success(self):
+        """已应用要报 ALREADY_APPLIED，不能当成功返回——重复写会污染结果。"""
+        store, ex = _store(replies=[[("applied", "snap-1", 2, "snap-1:2", None)]])
+        with self.assertRaises(ss.SnapshotStoreError) as ctx:
+            store.apply_proposal("prop-1", "u1", "snap-1:2", {})
+        self.assertEqual(ctx.exception.code, "ALREADY_APPLIED")
+        self.assertEqual(ex.rollbacks, 1)
+        self.assertEqual(ex.commits, 0)
+
+    def test_version_mismatch_is_snapshot_conflict(self):
+        store, ex = _store(replies=[[("pending", "snap-1", 2, "snap-1:3", None)]])
+        with self.assertRaises(ss.SnapshotStoreError) as ctx:
+            store.apply_proposal("prop-1", "u1", "snap-1:2", {})
+        self.assertEqual(ctx.exception.code, "SNAPSHOT_CONFLICT")
+        self.assertEqual(ex.rollbacks, 1)
+
+    def test_expired_proposal_is_proposal_expired(self):
+        store, ex = _store(replies=[[("pending", "snap-1", 2, "snap-1:2", None)], [(True,)]])
+        with self.assertRaises(ss.SnapshotStoreError) as ctx:
+            store.apply_proposal("prop-1", "u1", "snap-1:2", {})
+        self.assertEqual(ctx.exception.code, "PROPOSAL_EXPIRED")
+
+    def test_expiry_checked_by_database_not_client(self):
+        """过期判据必须是库的 now()，不是客户端传的时间。"""
+        store, ex = _store(replies=[[("pending", "snap-1", 2, "snap-1:2", None)], [(False,)]])
+        store.apply_proposal("prop-1", "u1", "snap-1:2", {})
+        expiry_sql = ex.statements[1][0].lower()
+        self.assertIn("expires_at <= now()", expiry_sql)
+
+    def test_proposal_locks_row_for_update(self):
+        store, ex = _store(replies=[[("pending", "snap-1", 2, "snap-1:2", None)], [(False,)]])
+        store.apply_proposal("prop-1", "u1", "snap-1:2", {})
+        lock_sql = ex.statements[0][0].lower()
+        self.assertIn("for update", lock_sql)
+
+    def test_success_writes_applied_change_then_updates_status(self):
+        store, ex = _store(replies=[
+            [("pending", "snap-1", 2, "snap-1:2", None)],
+            [(False,)],
+            [],
+            [],
+        ])
+        out = store.apply_proposal("prop-1", "u1", "snap-1:2", {"r": 1})
+        self.assertEqual(out["status"], "applied")
+        self.assertEqual(ex.commits, 1)
+        self.assertEqual(ex.rollbacks, 0)
+        kinds = [s[0].lower() for s in ex.statements]
+        self.assertIn("insert into checkd_demo.applied_change", kinds[2])
+        self.assertIn("update checkd_demo.proposal set status = 'applied'", kinds[3])
+
+    def test_unknown_proposal_is_not_found(self):
+        store, ex = _store(replies=[[]])
+        with self.assertRaises(ss.SnapshotStoreError) as ctx:
+            store.apply_proposal("prop-x", "u1", "snap-1:2", {})
+        self.assertEqual(ctx.exception.code, "NOT_FOUND")
+        self.assertEqual(ex.rollbacks, 1)
+
+
+class TestErrorMapping(unittest.TestCase):
+    class _PgErr(Exception):
+        def __init__(self, sqlstate, text):
+            super().__init__(text)
+            self.sqlstate = sqlstate
+
+    def test_unique_violation_on_applied_change_is_already_applied(self):
+        err = ss._map_db_error(self._PgErr("23505", 'duplicate key "applied_change_proposal_key"'),
+                               "apply_proposal")
+        self.assertEqual(err.code, "ALREADY_APPLIED")
+        self.assertFalse(err.retryable)
+
+    def test_unique_violation_on_latest_index_is_snapshot_conflict(self):
+        err = ss._map_db_error(self._PgErr("23505", 'duplicate key "snapshot_one_latest"'),
+                               "create_snapshot")
+        self.assertEqual(err.code, "SNAPSHOT_CONFLICT")
+
+    def test_fk_violation_is_user_ownership_breach(self):
+        err = ss._map_db_error(self._PgErr("23503", "violates foreign key"),
+                               "create_proposal")
+        self.assertEqual(err.code, "INTERNAL_ERROR")
+
+    def test_connection_error_is_retryable_dependency_unavailable(self):
+        err = ss._map_db_error(self._PgErr("08006", "connection failure"), "get_snapshot")
+        self.assertEqual(err.code, "DEPENDENCY_UNAVAILABLE")
+        self.assertTrue(err.retryable, "库抖动应可重试")
+
+    def test_serialization_failure_is_retryable(self):
+        err = ss._map_db_error(self._PgErr("40001", "could not serialize"), "apply_proposal")
+        self.assertEqual(err.code, "DEPENDENCY_UNAVAILABLE")
+        self.assertTrue(err.retryable)
+
+    def test_conflict_codes_are_not_retryable(self):
+        """409 三种都不可重试——重试同一份过期/冲突数据，结果不会变。"""
+        for code, text in (("23505", "applied_change"), ("23505", "snapshot_one_latest")):
+            err = ss._map_db_error(self._PgErr(code, text), "x")
+            self.assertFalse(err.retryable, err.code)
+
+    def test_only_known_codes(self):
+        """不新造码：所有抛出的 code 必须在 errors.py 闭集内。"""
+        allowed = set(ss._RETRYABLE) | {
+            "SNAPSHOT_CONFLICT", "PROPOSAL_EXPIRED", "ALREADY_APPLIED",
+            "INVALID_ARGUMENT", "NOT_FOUND", "INTERNAL_ERROR",
+        }
+        for state, text in (("23505", "applied_change"), ("23505", "snapshot_one_latest"),
+                            ("23503", "fk"), ("08006", "conn"), ("40001", "ser"), ("XX000", "wtf")):
+            err = ss._map_db_error(self._PgErr(state, text), "x")
+            self.assertIn(err.code, allowed)
+
+
+class TestTransactionSemantics(unittest.TestCase):
+    def test_failure_rolls_back_and_does_not_commit(self):
+        store, ex = _store(replies=[[(1,)], [(None,)], [("s", "e")]], fail_with=1)
+        with self.assertRaises(ss.SnapshotStoreError):
+            store.create_snapshot("u1", "2026-11-07", "2026-11-20", {})
+        self.assertEqual(ex.commits, 0)
+        self.assertGreaterEqual(ex.rollbacks, 1)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
