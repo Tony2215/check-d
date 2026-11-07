@@ -427,7 +427,7 @@ class SnapshotStore:
                     "insert into checkd_demo.proposal "
                     "(user_id, snapshot_id, snapshot_version, expires_at, plan) "
                     "values (%s, %s, %s, now() + make_interval(secs => %s), %s::jsonb) "
-                    "returning proposal_id, base_version, status, expires_at",
+                    "returning proposal_id, base_version, status, expires_at, created_at",
                     (user_id, snapshot_id, int(snapshot_version), self.proposal_ttl, raw_plan),
                 ).fetchone()
                 return {
@@ -435,6 +435,9 @@ class SnapshotStore:
                     "base_version": row[1],
                     "status": row[2],
                     "expires_at": _iso(row[3]),
+                    # generated_at 只能是库时间，不用进程时钟：容器与本机时区不同，
+                    # 契约要的是带偏移的服务端 instant。
+                    "generated_at": _iso(row[4]) if len(row) > 4 else None,
                     "snapshot_id": str(snapshot_id),
                     "snapshot_version": int(snapshot_version),
                     "plan_digest": payload_digest(plan)[0],
