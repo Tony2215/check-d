@@ -38,6 +38,37 @@ BIND=0.0.0.0 CHECKD_DEMO_TOKEN=<口令> CHECKD_ADMIN_KEY=<管理口令> PYTHONUN
 
 沙箱内绑 `0.0.0.0` 是平台要求（反向代理回源）。**沙箱外不要这么跑。**
 
+### 2.1 发布前必须重建并核对（2026-11-08 定稿）
+
+部署目录是**构建产物，不是真源**。仓库改了没重建就发布 = 带旧代码上线；
+而且 `/health` 的精简输出（4 键）**分辨不出上线件是哪个 commit**，事后没法从公网反推。
+2026-11-08 02:05 实测过：部署目录里 `snapshot_store.py` 落后两个提交（37,506 B，缺 TTL 两次修改），
+其余 11 个文件与 HEAD 逐字节相同——只有重建才会对上。
+
+每次发布前：
+
+```bash
+python work/m1/build_deploy.py               # 脚本先 rmtree 再重拼，可反复跑
+cat work/deploy/checkd-tools/MANIFEST.json   # 逐文件 bytes / sha256
+```
+
+核对判据（任一条不满足就别发布）——**比 LF 归一后的 sha256，不比字节数**：
+
+```bash
+cd work/repo/check-d
+for f in tools/m1-server/app.py tools/m1-server/errors.py \
+         tools/m1-server/snapshot_store.py tools/m1-server/explanations_filter.py \
+         tools/m1-mock/tool_server.py; do
+  echo "$f wt=$(tr -d '\r' < $f | sha256sum | cut -c1-16) head=$(git cat-file blob HEAD:$f | sha256sum | cut -c1-16)"
+done
+```
+
+- 每行两侧 16 位前缀必须相同；MANIFEST 的 `sha256` 应等于工作树文件的 sha256。
+- **为什么用 `tr -d '\r'`**：Windows 工作树的 `errors.py` 是 CRLF（8,137 B），HEAD blob 是 LF（7,943 B），
+  行数同为 194、LF 归一后 sha256 完全相同。直接比字节数会误判成「改过」。
+- 参照值：`snapshot_store.py` 在 11-07 之后应为 **39,993 B**。若 MANIFEST 里还是 **37,506 B**，
+  说明目录还是 `40e801f` 时代的旧件，TTL 两次修改都不在里面。
+
 ## 三、环境变量
 
 | 变量 | 作用 | 不设的后果 |
