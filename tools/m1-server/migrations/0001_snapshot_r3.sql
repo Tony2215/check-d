@@ -1,23 +1,37 @@
--- 0001_snapshot_r2.sql —— 独立 DEMO 快照库 · 修订版 R2
+-- 0001_snapshot_r3.sql —— 独立 DEMO 快照库 · 修订版 R3（取代 R2）
 --
--- 修订依据（不是我自己想的，逐条对应）：
---   M2 2026-11-07 02:54:35Z / 03:07:56Z 三项 P0（user_id 复合 FK / date_range 无格式约束 / 连接池）
---   M0 2026-11-07 03:07:56Z 工单 §二 P0-1~3、§三 P1-1~3、§四 1
--- 目标库：全新独立 DEMO，Postgres 14+，不触碰任何既有/PRODUCTION 库
--- 执行属性：**幂等**，可重复执行；检测到旧版 schema 时显式失败而非静默跳过
+-- 修订依据（逐条对应，不是我自己想的）：
+--   M2 2026-11-07T02:54:35Z / 03:07:56Z  三项 P0 初审
+--   M0 2026-11-07T03:07:56Z              工单 §二 P0-1~3、§三 P1-1~3、§四 1
+--   M2 2026-11-07T03:44:08Z              R2 复审：5 项认可 + 新增 1 个 P1 + 4 条 P2
+-- 目标库：全新独立 DEMO，Postgres 14+，不触碰任何既有 / PRODUCTION 库
+-- 执行属性：**幂等**，可重复执行；检测到旧版 schema 时显式失败，且**本脚本不做任何自动清理**
 --
--- 相对 R1（work/m1/outbox/2026-11-07_工作包A_...md 内嵌 DDL）的变更：
+-- R2 → R3 变更（R2 已认可的 5 项全部原样保留，不推翻）：
+--   P1    applied_change 增 (proposal_id, snapshot_id) 复合 FK 指向 proposal
+--         —— R2 只保证"各自同属一个 user"，没保证"两者指向同一份快照"；
+--            同 user 下可写出 proposal 指 A 快照、apply 记 B 快照的审计不一致。
+--   P2-1  snapshot / proposal 增 expires_at > created_at 约束（TTL 不能早于创建）
+--   P2-2  guard 的报错文案删掉 "drop schema cascade" 指导
+--         —— 报错文本会被照抄执行，一句指导就是一次误删风险；改为要求人工确认
+--   P2-3  删掉 snapshot_lookup 索引：与 snapshot_version_uk 列完全相同，纯冗余
+--   P2-4  权限语句并入本文件（原先散在文档里，漏执行就前功尽弃）
+--
+-- 相对 R1 的变更（历史保留，说明为什么改）：
 --   P0-1  snapshot 增 unique(snapshot_id,user_id)；proposal / applied_change 改复合 FK
---   P0-2  date_range text 拆为 date_from / date_to 两列（date 类型），据此建 latest 唯一索引
+--   P0-2  date_range text 拆为 date_from / date_to（date 类型），据此建 latest 唯一索引
 --   P1-1  全量 if not exists + 前置 guard，重复执行不报错
 --   P1-2  base_version 改生成列，唯一构造入口，不漂移
 --   P1-3  snapshot TTL 与 proposal TTL 两列分存分查（未合并）
 
 -- ============================================================
 -- 0. 前置 guard：拒绝在旧版 schema 上"假装成功"
+--    两条 guard 分别防两种最难查的半新半旧状态。
+--    注意：只 raise，不清库。清库是不可逆动作，不在迁移脚本里做。
 -- ============================================================
 do $$
 begin
+  -- 0.1 R1 特征列还在 → 主键/唯一索引与 R2+ 不兼容，且无法原地升级
   if exists (
     select 1 from information_schema.columns
      where table_schema = 'checkd_demo'
@@ -25,7 +39,21 @@ begin
        and column_name  = 'date_range'
   ) then
     raise exception
-      '检测到 R1 schema（checkd_demo.snapshot.date_range 存在）。R2 改动主键与唯一索引，不支持原地升级；请先 drop schema checkd_demo cascade（仅限独立 DEMO 库）后重跑本脚本。';
+      '检测到 R1 schema（checkd_demo.snapshot.date_range 存在）。R2/R3 改动主键与唯一索引，不支持原地升级。本脚本不会自动清理任何数据；请由库负责人确认后手工处理，或换一个全新的独立 DEMO 库执行。';
+  end if;
+
+  -- 0.2 表已在、但 R3 才有的约束不在 → 说明是 R1/R2 残留。
+  --     if not exists 会静默跳过建表，于是留下"表是旧的、脚本以为建好了"的状态。
+  --     这种状态最难查：跑起来不报错，约束却没生效。
+  if exists (
+    select 1 from information_schema.tables
+     where table_schema = 'checkd_demo' and table_name = 'applied_change'
+  ) and not exists (
+    select 1 from pg_constraint
+     where conname = 'applied_change_proposal_snapshot_fk'
+  ) then
+    raise exception
+      '检测到 R1/R2 残留 schema（applied_change 已存在但缺 R3 的 proposal↔snapshot 一致性约束）。本脚本不做原地升级，也不会自动清理；请换全新独立 DEMO 库执行。';
   end if;
 end $$;
 
@@ -64,6 +92,9 @@ create table if not exists checkd_demo.snapshot (
   constraint snapshot_version_pos check (version > 0),
   constraint snapshot_range_ck    check (date_from <= date_to),
   constraint snapshot_bytes_ck    check (payload_bytes >= 0),
+  -- P2-1：TTL 不能早于创建时刻。没有这条，一个算错的 TTL 会造出"生下来就过期"的快照，
+  -- 现象是生成立刻 409，而日志里看不出是 TTL 的错。
+  constraint snapshot_ttl_ck      check (expires_at > created_at),
   constraint snapshot_version_uk  unique (user_id, date_from, date_to, version),
   -- P0-1 关键：给 proposal / applied_change 的复合 FK 一个可指向的键。
   -- 单列 FK 允许 A 用户 proposal 指向 B 用户 snapshot，库不会拒；这一条才堵住。
@@ -71,12 +102,11 @@ create table if not exists checkd_demo.snapshot (
 );
 
 -- 同 (user_id, date_from, date_to) 任何时刻最多一个 latest
+-- P2-3：原 snapshot_lookup (user_id,date_from,date_to,version desc) 已删除——
+-- 它与 snapshot_version_uk 列完全相同，只多一个 desc 方向，PG 可反向扫描，纯冗余。
 create unique index if not exists snapshot_one_latest
   on checkd_demo.snapshot (user_id, date_from, date_to)
   where superseded_at is null;
-
-create index if not exists snapshot_lookup
-  on checkd_demo.snapshot (user_id, date_from, date_to, version desc);
 
 create index if not exists snapshot_expiry
   on checkd_demo.snapshot (expires_at) where superseded_at is null;
@@ -99,11 +129,16 @@ create table if not exists checkd_demo.proposal (
   applied_at       timestamptz,
   constraint proposal_status_ck check (status in ('pending','applied','rejected','expired')),
   constraint proposal_version_pos check (snapshot_version > 0),
+  -- P2-1：同 snapshot，TTL 不能早于创建
+  constraint proposal_ttl_ck check (expires_at > created_at),
   -- P0-1：复合 FK。proposal.user_id 必须与自己引用的 snapshot.user_id 相同
   constraint proposal_snapshot_fk foreign key (snapshot_id, user_id)
     references checkd_demo.snapshot (snapshot_id, user_id),
-  -- 供 applied_change 复合 FK 指向
-  constraint proposal_id_user_uk unique (proposal_id, user_id)
+  -- 供 applied_change 复合 FK 指向（P0-1 用 user 维度）
+  constraint proposal_id_user_uk unique (proposal_id, user_id),
+  -- P1(R3 新增)：供 applied_change 用 snapshot 维度指向。
+  -- 有了这条，"这个提案是基于哪份快照"才有库级唯一答案。
+  constraint proposal_id_snapshot_uk unique (proposal_id, snapshot_id)
 );
 
 create index if not exists proposal_user
@@ -123,15 +158,52 @@ create table if not exists checkd_demo.applied_change (
   result       jsonb       not null,
   -- 幂等最后一道闸：并发两个 apply 都过了前置检查，第二个在插入时冲突 → 回滚 → ALREADY_APPLIED
   constraint applied_change_proposal_uk unique (proposal_id),
-  -- P0-1：applied_change 按同一归属原则约束，proposal 与 snapshot 都必须同属一个 user
+  -- P0-1：归属一致。proposal 与 snapshot 都必须同属一个 user
   constraint applied_change_proposal_fk foreign key (proposal_id, user_id)
     references checkd_demo.proposal (proposal_id, user_id),
   constraint applied_change_snapshot_fk foreign key (snapshot_id, user_id)
-    references checkd_demo.snapshot (snapshot_id, user_id)
+    references checkd_demo.snapshot (snapshot_id, user_id),
+  -- P1(R3)：**指向一致**。上面两条合起来只保证"各自同属一个 user"，
+  -- 仍可写出 proposal 指 A 快照、apply 记 B 快照 —— 审计链断开而库不拒。
+  -- 这条复合 FK 把 applied_change.snapshot_id 钉死在 proposal 自己的那份快照上。
+  constraint applied_change_proposal_snapshot_fk foreign key (proposal_id, snapshot_id)
+    references checkd_demo.proposal (proposal_id, snapshot_id)
 );
 
 -- ============================================================
--- 5. 发号：单语句，禁止 select max+1
+-- 5. 权限（P2-4：并入本文件，原先散在文档里，漏执行就前功尽弃）
+--    原则：默认拒绝。schema 不给 public；Supabase 的 anon / authenticated
+--    若存在也一并收回（这两个角色默认有 public schema 权限）。
+--    只授予本连接使用的那一个角色（当前连接用户 + 可选 CHECKD_APP_ROLE）。
+-- ============================================================
+revoke all on schema checkd_demo from public;
+
+do $$
+declare
+  r text;
+begin
+  -- 5.1 收掉 Supabase 内置角色的权限（角色不存在则跳过，纯 PG 环境不报错）
+  foreach r in array array['anon', 'authenticated'] loop
+    if exists (select 1 from pg_roles where rolname = r) then
+      execute format('revoke all on schema checkd_demo from %I', r);
+      execute format('revoke all on all tables in schema checkd_demo from %I', r);
+    end if;
+  end loop;
+
+  -- 5.2 schema 使用权限只给当前连接用户（迁移执行者 = 应用角色时不需额外授）
+  execute format('grant usage on schema checkd_demo to %I', current_user);
+
+  -- 5.3 表级权限：服务端只需要读 + 写，不需要 DDL
+  execute format('grant select, insert, update on all tables in schema checkd_demo to %I',
+                 current_user);
+end $$;
+
+-- 5.4 以后新建的表也自动只给当前用户（本迁移之后再无新表，留着防以后加表漏配）
+alter default privileges in schema checkd_demo
+  revoke all on tables from public;
+
+-- ============================================================
+-- 6. 发号：单语句，禁止 select max+1
 --    首次插入 next_version=2 → 返回 1；并发第二次阻塞在该行 update → 3 → 返回 2
 -- ============================================================
 -- insert into checkd_demo.snapshot_seq (user_id, date_from, date_to, next_version)
@@ -142,7 +214,7 @@ create table if not exists checkd_demo.applied_change (
 -- returning next_version - 1 as version;
 
 -- ============================================================
--- 6. 取新号后的同事务两步（锁序固定：seq 行 → 旧 latest 行 → 插新行）
+-- 7. 取新号后的同事务两步（锁序固定：seq 行 → 旧 latest 行 → 插新行）
 -- ============================================================
 -- update checkd_demo.snapshot set superseded_at = now()
 --  where user_id = $1 and date_from = $2 and date_to = $3 and superseded_at is null;
