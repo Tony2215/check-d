@@ -63,6 +63,11 @@ _RETRYABLE = {
     _CODE_DEPENDENCY_UNAVAILABLE: True,
 }
 
+# 快照 TTL 相对提案 TTL 的余量（秒）。快照先插入、提案后插入，两条 expires_at 各由
+# 自己的 now() 算；余量为 0 时提案到期前会出现「提案有效、快照已过期」的毫秒窗口。
+# 60 s 只覆盖两次插入的间隔，不改变契约对提案 30 分钟的规定。
+SNAPSHOT_TTL_MARGIN_SECONDS = 60
+
 
 class SnapshotStoreError(Exception):
     """带契约码的存储错误。上层直接取 .code / .retryable 组信封。"""
@@ -264,7 +269,7 @@ class _RecordingCursor:
 
 class SnapshotStore:
     def __init__(self, dsn=None, executor=None,
-                 snapshot_ttl_seconds=1800, proposal_ttl_seconds=1800):
+                 snapshot_ttl_seconds=None, proposal_ttl_seconds=1800):
         """TTL 默认值按契约定死，不做成可配置。
 
         契约原文（blob 9579be9e，L344-345）：「Proposal 自 `generated_at` 起固定有效
@@ -273,14 +278,27 @@ class SnapshotStore:
         写进去的 `expires_at` 会比契约允许的提前 20 分钟到期，调用方按契约算的时间
         再来 validate 就会拿到 PROPOSAL_EXPIRED。现已对齐 1800 s。
 
-        快照 TTL 必须 >= 提案 TTL，否则会出现自相矛盾的窗口：提案还在 30 分钟有效期内，
-        它绑定的快照却已过期，validate/request_approval/apply 三处都会返回
-        SNAPSHOT_CONFLICT —— 契约给的权利被自家数据驳回。故两者同取 1800 s，
-        让快照至少活得和提案一样久。
+        快照 TTL 必须**严格长于**提案 TTL 至少 `SNAPSHOT_TTL_MARGIN_SECONDS`，只
+        「>=」不够（M3 提、M2 16:09Z 附议的毫秒窗口）：两值相等时，快照先插入、
+        提案后插入，两条 `expires_at` 都是各自的 `now() + interval`，于是提案到期
+        前那几十毫秒里「提案仍有效、快照已过期」，validate / request_approval /
+        apply 一律返回 SNAPSHOT_CONFLICT —— 一个必现但极窄的自相矛盾窗口。
+        故快照默认取 `proposal_ttl + 60 s`（1860），多出的 60 s 只是给插入间隔留余量，
+        不改变契约对提案的 30 分钟。
         """
         self._ex = executor if executor is not None else PgExecutor(dsn or os.environ.get("CHECKD_DEMO_DSN", ""))
-        self.snapshot_ttl = int(snapshot_ttl_seconds)
         self.proposal_ttl = int(proposal_ttl_seconds)
+        minimum_snapshot_ttl = self.proposal_ttl + SNAPSHOT_TTL_MARGIN_SECONDS
+        if snapshot_ttl_seconds is None:
+            self.snapshot_ttl = minimum_snapshot_ttl
+        else:
+            self.snapshot_ttl = int(snapshot_ttl_seconds)
+            if self.snapshot_ttl < minimum_snapshot_ttl:
+                # 显式放宽到相等/更短时直接失败，不静默接受：那正是上面的毫秒窗口。
+                raise ValueError(
+                    "snapshot_ttl_seconds 必须 >= proposal_ttl + %d（%d），收到 %d；"
+                    "两者相等会在 TTL 边界造出「提案有效但快照已过期」的窗口。"
+                    % (SNAPSHOT_TTL_MARGIN_SECONDS, minimum_snapshot_ttl, self.snapshot_ttl))
 
     # ---------- 生命周期 ----------
 
@@ -566,7 +584,7 @@ class SnapshotStore:
             # 原先只判 p.expires_at，snapshot.expires_at 存了却从没被读过 ——
             # 当时默认 proposal TTL 600s < snapshot TTL 900s，所以「提案先过期」掩盖了这个洞；
             # 一旦把 snapshot TTL 调短，就会出现「拿过期快照 validate/apply」。
-            # 现两者同取 1800 s（见 __init__ 说明），但这个字段仍必须独立判、
+            # 现快照 1860 s / 提案 1800 s（见 __init__ 说明），但这个字段仍必须独立判、
             # 不能靠「提案没过期」推论快照没过期。
             "snapshot_expired": bool(row[11]),
             "date_from": _iso_date(row[12]),

@@ -431,15 +431,37 @@ class TestTTLContract(unittest.TestCase):
         self.assertEqual(store.proposal_ttl, self.CONTRACT_PROPOSAL_TTL,
                          "契约写死 30 分钟；改这个值必须先改契约")
 
-    def test_snapshot_ttl_not_shorter_than_proposal_ttl(self):
+    def test_snapshot_ttl_strictly_longer_than_proposal_ttl(self):
         """快照活得比提案短 = 契约给的权利被自家数据驳回。
 
         提案在 30 分钟有效期内，但绑定的快照 15 分钟就过期 → validate /
         request_approval / apply 全返回 SNAPSHOT_CONFLICT，用户拿着合规提案却走不下去。
+
+        只判 `>=` 不够（M3 提、M2 2026-11-07T16:09Z 附议）：快照先插入、提案后插入，
+        两条 `expires_at` 各由自己的 `now() + interval` 算；两值相等时，提案到期前
+        那几十毫秒里「提案仍有效、快照已过期」，必现毫秒级 SNAPSHOT_CONFLICT。
+        故这里要求严格长出余量，不是只要求不短。
         """
-        store, _ = _store()
-        self.assertGreaterEqual(store.snapshot_ttl, store.proposal_ttl,
-                                "快照 TTL 必须 >= 提案 TTL，否则 TTL 内提案不可用")
+        store, ex = _store(replies=[[(1,)], [(None,)], [("uuid-1", "2026-11-07T12:00:00+08:00")]])
+        margin = ss.SNAPSHOT_TTL_MARGIN_SECONDS
+        self.assertEqual(store.snapshot_ttl, store.proposal_ttl + margin,
+                         "快照 TTL 必须是提案 TTL + 余量")
+        self.assertGreater(store.snapshot_ttl, store.proposal_ttl,
+                           "两值相等会造出「提案有效但快照已过期」的毫秒窗口")
+        # 余量要真的进 SQL：create_snapshot 的参数里是 1860，不是 1800。
+        store.create_snapshot("u1", "2026-11-01", "2026-11-07", {"tasks": []})
+        sql, params = ex.statements[-1]
+        self.assertIn("now() + make_interval", sql)
+        self.assertIn(store.snapshot_ttl, params)
+        self.assertNotIn(store.proposal_ttl, params)
+
+    def test_explicit_snapshot_ttl_equal_to_proposal_ttl_is_rejected(self):
+        """显式把快照 TTL 设成与提案相等时必须失败，不许静默接受那个毫秒窗口。"""
+        with self.assertRaises(ValueError):
+            ss.SnapshotStore(
+                executor=ss.RecordingExecutor(),
+                snapshot_ttl_seconds=self.CONTRACT_PROPOSAL_TTL,
+                proposal_ttl_seconds=self.CONTRACT_PROPOSAL_TTL)
 
     def test_create_proposal_passes_contract_ttl_to_sql(self):
         """默认值要真的进到 SQL 参数里，不能只停在对象属性上。"""
