@@ -39,11 +39,15 @@
 | 3 | REFUSED：写路径缺 `--i-have-m0-approval` |
 | 4 | BLOCKED：只读证明失败（连接非只读，或探针建表成功），后续检查一律未执行 |
 
-## 结果文件路径（固定，与 cwd 无关）
+## 结果文件路径（唯一，与 cwd 无关）
 
-1. 上溯找到 `work/m1/` → `work/m1/preflight_snapshot_db_result.json`
-2. 否则（干净 clone）→ `<仓库根>/preflight_snapshot_db_result.json`
-3. 要别的路径用 `--out`。**不再静默回退当前目录**（M0 令 N1）。
+只有一处：`<仓库根>/preflight_snapshot_db_result.json`
+（仓库根由本文件位置上溯确定，找同时含 `tools/` 与 `tools/m1-server/` 的目录）。
+要别的路径用 `--out`。**不再按环境分叉、不回退当前目录**（M0 令 N1）。
+
+该文件由**仓库根的 `.gitignore`** 忽略 —— 注意不是 `tools/m1-server/.gitignore`：
+git 只按「文件所在目录到根」的路径匹配，忽略文件放子目录管不到仓库根的文件。
+（`tools/m1-server/.gitignore` 保留，只覆盖 `--out` 指到本目录的情况。）
 
 ## 不做什么
 

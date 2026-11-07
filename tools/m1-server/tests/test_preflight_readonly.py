@@ -181,10 +181,32 @@ class TestOutputPath(unittest.TestCase):
                 os.chdir(cwd)
 
     def test_gitignored(self):
-        gi = os.path.join(SRC_DIR, ".gitignore")
-        self.assertTrue(os.path.exists(gi), "输出文件必须被忽略，否则跑一次就脏工作区")
-        self.assertIn("preflight_snapshot_db_result.json",
-                      open(gi, encoding="utf-8").read())
+        """M2 2026-11-07 P1：忽略规则必须真的作用到默认输出路径。
+
+        旧断言只读 `tools/m1-server/.gitignore` 的文本就判绿 —— 但默认输出落在**仓库根**，
+        git 的忽略匹配是「从文件所在目录向上」，子目录里的规则管不到仓库根的文件。
+        那条断言因此是假绿：测试绿，跑一次 preflight 仍然脏工作区。
+        现在改用 git 本人的判定（`git check-ignore`），并要求生效规则来自**仓库根**的 .gitignore。
+        """
+        out = pf.default_out()
+        repo_root = os.path.dirname(out)
+        name = os.path.basename(out)
+        try:
+            p = subprocess.run(["git", "-C", repo_root, "check-ignore", "-v", name],
+                               capture_output=True, text=True)
+        except (OSError, FileNotFoundError):
+            self.skipTest("本机没有 git，无法验证真实忽略状态")
+        if p.returncode not in (0, 1):
+            self.skipTest("git check-ignore 不可用：%s" % (p.stderr or "").strip()[:200])
+        self.assertEqual(
+            p.returncode, 0,
+            "默认输出文件未被 git 忽略，跑一次就脏工作区：%s" % out)
+        src = p.stdout.split(":", 1)[0].strip()
+        src_abs = src if os.path.isabs(src) else os.path.join(repo_root, src)
+        self.assertEqual(
+            os.path.normcase(os.path.abspath(src_abs)),
+            os.path.normcase(os.path.abspath(os.path.join(repo_root, ".gitignore"))),
+            "生效的忽略规则必须来自仓库根 .gitignore，实际来自：%s" % src)
 
     def test_default_out_independent_of_cwd(self):
         """N1（M0 2026-11-07）：结果路径不得随 cwd 变。

@@ -50,4 +50,7 @@ pnpm-debug.log*
 *.tmp
 *.temp
 
+# M1 preflight 输出（默认落仓库根；内容含目标库 host/dbname/user 与检查结果，不提交）
+preflight_snapshot_db_result.json
+
 android/key.properties
