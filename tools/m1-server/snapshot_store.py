@@ -472,7 +472,7 @@ class SnapshotStore:
 
     # ---------- apply ----------
 
-    def apply_proposal(self, proposal_id, user_id, base_version, result_payload):
+    def apply_proposal(self, proposal_id, user_id, base_version):
         """同一事务内：锁提案 → 校验（归属/状态/过期/版本）→ 幂等查 → 写 applied_change → 置 applied。
 
         锁序 proposal → snapshot，与 create_snapshot（seq → snapshot）只在 snapshot 行交叉。
@@ -486,7 +486,7 @@ class SnapshotStore:
             with self._ex.transaction() as conn:
                 # 1) 锁提案。for update 让并发 apply 串行在这一行上
                 row = conn.execute(
-                    "select status, snapshot_id, snapshot_version, base_version, expires_at "
+                    "select status, snapshot_id, snapshot_version, base_version, expires_at, plan "
                     "  from checkd_demo.proposal "
                     " where proposal_id = %s and user_id = %s for update",
                     (proposal_id, user_id),
@@ -494,7 +494,10 @@ class SnapshotStore:
                 if row is None:
                     raise SnapshotStoreError(_CODE_NOT_FOUND,
                                              "提案不存在或不属于当前用户。")
-                status, snap_id, snap_ver, db_base_version, expires_at = row
+                status, snap_id, snap_ver, db_base_version, expires_at = row[:5]
+                # 契约 L514：服务端必须加载自己保存的 Proposal，不接受调用方重传。
+                # 所以方案从这一行里读，不从入参拿。
+                saved_plan = row[5] if len(row) > 5 else None
 
                 # 2) 已应用 → 幂等错误，不是"成功"
                 if status == "applied":
@@ -525,7 +528,13 @@ class SnapshotStore:
 
                 # 6) 写 applied_change。proposal_id 上的 unique 是幂等最后一道闸：
                 #    并发两个 apply 都过了上面所有检查，第二个在这里撞唯一键 → 回滚 → 报 ALREADY_APPLIED
-                raw = canonical_payload(result_payload)
+                if saved_plan is None:
+                    # 宁可报错也不拿调用方传的东西顶替 —— 那正是契约禁的动作。
+                    raise SnapshotStoreError(
+                        _CODE_INTERNAL_ERROR,
+                        "提案缺少已保存的方案内容（plan 为空），拒绝执行。")
+                raw = (saved_plan if isinstance(saved_plan, str)
+                       else canonical_payload(saved_plan))
                 conn.execute(
                     "insert into checkd_demo.applied_change "
                     "(proposal_id, user_id, snapshot_id, result) "

@@ -127,13 +127,13 @@ class TestUserIsolation(unittest.TestCase):
 class TestApplyProposal(unittest.TestCase):
     def _apply(self, replies, base_version="snap-1:2"):
         store, ex = _store(replies=replies)
-        return store, ex, store.apply_proposal("prop-1", "u1", base_version, {"ok": True})
+        return store, ex, store.apply_proposal("prop-1", "u1", base_version)
 
     def test_already_applied_is_error_not_success(self):
         """已应用要报 ALREADY_APPLIED，不能当成功返回——重复写会污染结果。"""
         store, ex = _store(replies=[[("applied", "snap-1", 2, "snap-1:2", None)]])
         with self.assertRaises(ss.SnapshotStoreError) as ctx:
-            store.apply_proposal("prop-1", "u1", "snap-1:2", {})
+            store.apply_proposal("prop-1", "u1", "snap-1:2")
         self.assertEqual(ctx.exception.code, "ALREADY_APPLIED")
         self.assertEqual(ex.rollbacks, 1)
         self.assertEqual(ex.commits, 0)
@@ -141,37 +141,37 @@ class TestApplyProposal(unittest.TestCase):
     def test_version_mismatch_is_snapshot_conflict(self):
         store, ex = _store(replies=[[("pending", "snap-1", 2, "snap-1:3", None)]])
         with self.assertRaises(ss.SnapshotStoreError) as ctx:
-            store.apply_proposal("prop-1", "u1", "snap-1:2", {})
+            store.apply_proposal("prop-1", "u1", "snap-1:2")
         self.assertEqual(ctx.exception.code, "SNAPSHOT_CONFLICT")
         self.assertEqual(ex.rollbacks, 1)
 
     def test_expired_proposal_is_proposal_expired(self):
-        store, ex = _store(replies=[[("pending", "snap-1", 2, "snap-1:2", None)], [(True,)]])
+        store, ex = _store(replies=[[("pending", "snap-1", 2, "snap-1:2", None, {"blocks": []})], [(True,)]])
         with self.assertRaises(ss.SnapshotStoreError) as ctx:
-            store.apply_proposal("prop-1", "u1", "snap-1:2", {})
+            store.apply_proposal("prop-1", "u1", "snap-1:2")
         self.assertEqual(ctx.exception.code, "PROPOSAL_EXPIRED")
 
     def test_expiry_checked_by_database_not_client(self):
         """过期判据必须是库的 now()，不是客户端传的时间。"""
-        store, ex = _store(replies=[[("pending", "snap-1", 2, "snap-1:2", None)], [(False,)]])
-        store.apply_proposal("prop-1", "u1", "snap-1:2", {})
+        store, ex = _store(replies=[[("pending", "snap-1", 2, "snap-1:2", None, {"blocks": []})], [(False,)]])
+        store.apply_proposal("prop-1", "u1", "snap-1:2")
         expiry_sql = ex.statements[1][0].lower()
         self.assertIn("expires_at <= now()", expiry_sql)
 
     def test_proposal_locks_row_for_update(self):
-        store, ex = _store(replies=[[("pending", "snap-1", 2, "snap-1:2", None)], [(False,)]])
-        store.apply_proposal("prop-1", "u1", "snap-1:2", {})
+        store, ex = _store(replies=[[("pending", "snap-1", 2, "snap-1:2", None, {"blocks": []})], [(False,)]])
+        store.apply_proposal("prop-1", "u1", "snap-1:2")
         lock_sql = ex.statements[0][0].lower()
         self.assertIn("for update", lock_sql)
 
     def test_success_writes_applied_change_then_updates_status(self):
         store, ex = _store(replies=[
-            [("pending", "snap-1", 2, "snap-1:2", None)],
+            [("pending", "snap-1", 2, "snap-1:2", None, {"blocks": [1], "changes": [2]})],
             [(False,)],
             [],
             [],
         ])
-        out = store.apply_proposal("prop-1", "u1", "snap-1:2", {"r": 1})
+        out = store.apply_proposal("prop-1", "u1", "snap-1:2")
         self.assertEqual(out["status"], "applied")
         self.assertEqual(ex.commits, 1)
         self.assertEqual(ex.rollbacks, 0)
@@ -179,10 +179,50 @@ class TestApplyProposal(unittest.TestCase):
         self.assertIn("insert into checkd_demo.applied_change", kinds[2])
         self.assertIn("update checkd_demo.proposal set status = 'applied'", kinds[3])
 
+    def test_missing_plan_refuses_instead_of_using_caller_input(self):
+        """库里没有 plan 时必须拒，不能拿调用方的东西顶替（契约 L514）。"""
+        store, ex = _store(replies=[
+            [("pending", "snap-1", 2, "snap-1:2", None)],   # 只有 5 列，没有 plan
+            [(False,)],
+        ])
+        with self.assertRaises(ss.SnapshotStoreError) as ctx:
+            store.apply_proposal("prop-1", "u1", "snap-1:2")
+        self.assertEqual(ctx.exception.code, "INTERNAL_ERROR")
+        kinds = [x[0].lower() for x in ex.statements]
+        self.assertFalse(any("insert into checkd_demo.applied_change" in k for k in kinds),
+                         "plan 缺失时不能写 applied_change")
+        self.assertEqual(ex.commits, 0)
+
+    def test_applied_record_uses_saved_plan(self):
+        """写进 applied_change 的必须是库里的 plan，不是任何外部入参。"""
+        saved = {"blocks": [{"task_id": "t_1"}], "changes": [], "unplanned_tasks": []}
+        store, ex = _store(replies=[
+            [("pending", "snap-1", 2, "snap-1:2", None, saved)],
+            [(False,)],
+            [],
+            [],
+        ])
+        store.apply_proposal("prop-1", "u1", "snap-1:2")
+        insert_stmt = [x for x in ex.statements if "insert into checkd_demo.applied_change" in x[0]][0]
+        self.assertIn("t_1", str(insert_stmt[1]), "落库内容应来自库里的 plan")
+
+    def test_select_reads_plan_column(self):
+        """apply 的 select 必须把 plan 一起取出来，否则上面两条都无从谈起。"""
+        store, ex = _store(replies=[
+            [("pending", "snap-1", 2, "snap-1:2", None, {"blocks": []})],
+            [(False,)],
+            [],
+            [],
+        ])
+        store.apply_proposal("prop-1", "u1", "snap-1:2")
+        head_sql = ex.statements[0][0].lower()
+        self.assertIn("plan", head_sql)
+        self.assertIn("for update", head_sql)
+
     def test_unknown_proposal_is_not_found(self):
         store, ex = _store(replies=[[]])
         with self.assertRaises(ss.SnapshotStoreError) as ctx:
-            store.apply_proposal("prop-x", "u1", "snap-1:2", {})
+            store.apply_proposal("prop-x", "u1", "snap-1:2")
         self.assertEqual(ctx.exception.code, "NOT_FOUND")
         self.assertEqual(ex.rollbacks, 1)
 
