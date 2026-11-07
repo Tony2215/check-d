@@ -174,3 +174,35 @@ cd <仓库根> && CHECKD_DEMO_DSN="$CHECKD_DEMO_DSN" \
 - 只读证明失败（连接非只读，或探针临时表居然建成功）**立即 exit 4**，
   不再跑 schema/权限检查，也不会去「清理」探针表（只回滚事务）。
 
+### 9.2 干净 Mac 首次安装与运行（2026-11-08 修正版）
+
+适用：机器上没装过 psycopg3、也没建过虚拟环境。**逐行照抄，别改顺序。**
+
+```bash
+git clone -b demo/competition-11010 https://github.com/Tony2215/check-d.git
+cd check-d
+git rev-parse HEAD                    # 期望 1a426717… 之后的最新 head
+python3 -m venv .venv
+. .venv/bin/activate                  # 之后所有命令都在这个 venv 里
+python -m pip install -U pip 'psycopg[binary]'
+env -u DATABASE_URL CHECKD_DEMO_DSN='postgresql://用户:口令@主机:5432/库名' \
+  python tools/m1-server/preflight_snapshot_db.py
+cat ./preflight_snapshot_db_result.json
+```
+
+三处与 2026-11-08 之前的旧命令不同，都是 11-08 复核后改的：
+
+1. **用 venv，不用 `pip install --user`**。macOS 上 python.org / Homebrew 的 3.11+
+   是 PEP 668 externally-managed 环境，`--user` 会被 `error: externally-managed-environment`
+   直接拒掉。venv 是唯一不需要动系统 Python 的做法。
+2. **命令前加 `env -u DATABASE_URL`**。脚本取 DSN 的顺序是
+   `CHECKD_DEMO_DSN` → `DATABASE_URL`（见 `preflight_snapshot_db.py` 的 `main()`）。
+   `CHECKD_DEMO_DSN` 非空时不会读 `DATABASE_URL`，所以这是**纵深防御**、不是修 bug：
+   万一 DSN 那串打错或为空，脚本会默默回退到你 shell 里别的 `DATABASE_URL`（可能是正式库）。
+   剥掉它，就不会连错库。**别指望脚本自己发现连错了。**
+3. **`psycopg[binary]` 不锁版本**。现网 3.3.8 已提供 cp315（Python 3.15）macOS 轮子，
+   3.9–3.15 都装得上；锁版本反而会在新解释器上找不到匹配轮子。
+
+跑完看三样：退出码（`0` 才算无 FAIL）、`结果文件:` 打印的绝对路径、JSON 里只出现
+host/dbname/user 三项（**不含 DSN**）。退出码 2 = 没拿到库或缺 psycopg3，不是代码失败。
+
