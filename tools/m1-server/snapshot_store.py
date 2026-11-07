@@ -408,17 +408,27 @@ class SnapshotStore:
 
     # ---------- Proposal ----------
 
-    def create_proposal(self, user_id, snapshot_id, snapshot_version):
-        """建提案。base_version 由库生成列产出，这里只负责读回来。"""
+    def create_proposal(self, user_id, snapshot_id, snapshot_version, plan):
+        """建提案。base_version 由库生成列产出，这里只负责读回来。
+
+        `plan` 是服务端自己生成的完整提案内容（blocks / changes / unplanned_tasks /
+        explanations）。**必须存库**，原因写在契约 L514：apply 时服务端必须加载自己
+        保存的 Proposal，不接受调用方重新提交。若不存，apply 就只能靠调用方重传，
+        那等于把"可信输入"交回给调用方，契约明禁。
+        """
         _require_text(user_id, "user_id")
+        if not isinstance(plan, dict):
+            raise SnapshotStoreError(_CODE_INVALID_ARGUMENT,
+                                     "plan 必须是对象（含 blocks/changes/unplanned_tasks）。")
+        raw_plan = canonical_payload(plan)
         try:
             with self._ex.transaction() as conn:
                 row = conn.execute(
                     "insert into checkd_demo.proposal "
-                    "(user_id, snapshot_id, snapshot_version, expires_at) "
-                    "values (%s, %s, %s, now() + make_interval(secs => %s)) "
+                    "(user_id, snapshot_id, snapshot_version, expires_at, plan) "
+                    "values (%s, %s, %s, now() + make_interval(secs => %s), %s::jsonb) "
                     "returning proposal_id, base_version, status, expires_at",
-                    (user_id, snapshot_id, int(snapshot_version), self.proposal_ttl),
+                    (user_id, snapshot_id, int(snapshot_version), self.proposal_ttl, raw_plan),
                 ).fetchone()
                 return {
                     "proposal_id": str(row[0]),
@@ -427,6 +437,7 @@ class SnapshotStore:
                     "expires_at": _iso(row[3]),
                     "snapshot_id": str(snapshot_id),
                     "snapshot_version": int(snapshot_version),
+                    "plan_digest": payload_digest(plan)[0],
                 }
         except SnapshotStoreError:
             raise

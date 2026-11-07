@@ -127,7 +127,15 @@ create table if not exists checkd_demo.proposal (
   created_at       timestamptz not null default now(),
   expires_at       timestamptz not null,   -- proposal TTL，与 snapshot.expires_at 是两个字段两条语义
   applied_at       timestamptz,
+  -- 2026-11-07 12:12 追加（本文件尚未在任何库执行过，故原地增补，不升版本号）：
+  -- 服务端必须保存自己生成的完整提案内容。契约 L514 原文：「服务端必须加载自己保存的
+  -- Proposal 和快照绑定；不接受调用方重新提交完整 Proposal 作为可信输入。」
+  -- 没有这一列，apply 只能让调用方把方案再传一遍 —— 那正是契约禁止的做法。
+  plan              jsonb       not null,
+  validation_status text        not null default 'unvalidated',
   constraint proposal_status_ck check (status in ('pending','applied','rejected','expired')),
+  constraint proposal_validation_ck check (validation_status in ('unvalidated','valid','invalid')),
+  constraint proposal_plan_ck check (jsonb_typeof(plan) = 'object'),
   constraint proposal_version_pos check (snapshot_version > 0),
   -- P2-1：同 snapshot，TTL 不能早于创建
   constraint proposal_ttl_ck check (expires_at > created_at),

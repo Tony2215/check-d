@@ -237,6 +237,41 @@ class TestErrorMapping(unittest.TestCase):
             self.assertIn(err.code, allowed)
 
 
+class TestProposalStoresPlan(unittest.TestCase):
+    """契约 L514：apply 时服务端必须加载自己保存的 Proposal。
+    所以要成立，create_proposal 必须把方案本身存进库，不能只存一个 id。"""
+
+    def test_plan_is_persisted_not_just_referenced(self):
+        # returning proposal_id, base_version, status, expires_at
+        store, ex = _store(replies=[[("p-1", "s-1:3", "pending", "2026-11-07T10:00:00Z")]])
+        out = store.create_proposal("u1", "s-1", 3, {"blocks": [], "changes": [], "unplanned_tasks": []})
+        self.assertEqual(out["proposal_id"], "p-1")
+        self.assertEqual(out["base_version"], "s-1:3")
+        sql, params = ex.statements[0]
+        self.assertIn("plan", sql)
+        # plan 必须作为参数真正传下去，而不是写死在 SQL 里
+        self.assertTrue(any("blocks" in str(p) for p in params), params)
+
+    def test_plan_must_be_object(self):
+        store, ex = _store(replies=[[("p-1", "s-1:3", "pending", "2026-11-07T10:00:00Z")]])
+        for bad in (None, [], "x", 1):
+            with self.assertRaises(ss.SnapshotStoreError) as ctx:
+                store.create_proposal("u1", "s-1", 3, bad)
+            self.assertEqual(ctx.exception.code, "INVALID_ARGUMENT")
+        self.assertEqual(ex.statements, [], "参数不合法时不应该真的发 SQL")
+
+    def test_plan_digest_ignores_key_order(self):
+        store, ex = _store(replies=[[("p-1", "s-1:3", "pending", "2026-11-07T10:00:00Z")]])
+        a = store.create_proposal("u1", "s-1", 3, {"blocks": [1], "changes": []})
+        store2, ex2 = _store(replies=[[("p-1", "s-1:3", "pending", "2026-11-07T10:00:00Z")]])
+        b = store2.create_proposal("u1", "s-1", 3, {"changes": [], "blocks": [1]})
+        self.assertEqual(a["plan_digest"], b["plan_digest"])
+        # 而真正不同的内容必须给出不同摘要，别把 digest 写成常量
+        store3, _ = _store(replies=[[("p-1", "s-1:3", "pending", "2026-11-07T10:00:00Z")]])
+        c = store3.create_proposal("u1", "s-1", 3, {"blocks": [2], "changes": []})
+        self.assertNotEqual(a["plan_digest"], c["plan_digest"])
+
+
 class TestTransactionSemantics(unittest.TestCase):
     def test_failure_rolls_back_and_does_not_commit(self):
         store, ex = _store(replies=[[(1,)], [(None,)], [("s", "e")]], fail_with=1)
