@@ -1,20 +1,39 @@
 #!/usr/bin/env python
 """checkd 快照库预检 —— 拿到 DSN 后一条命令出结果。
 
-用法：
-    CHECKD_DEMO_DSN="postgresql://..." python work/m1/preflight_snapshot_db.py
-    CHECKD_DEMO_DSN="..." python work/m1/preflight_snapshot_db.py --apply   # 顺带跑 migration
+三个模式，互斥，默认是真只读：
 
-设计原则（对应 M0 D 条「证明不了就标 BLOCKED」）：
-  1. 每条检查都给出「查到了什么」，不是只给 PASS —— 失败时能直接定位。
-  2. 只读检查与写入检查分开。写入检查最后跑，且自己清理自己造的数据。
-  3. 任何一条 FAIL 都不影响后面的检查继续跑，最后一次性汇总 —— 别在第一条就退出，
-     否则要来回好几轮才知道全貌。
-  4. 不打印 DSN 原文（含口令），只打印 host 与库名。
+    # 默认：只读探测。只发 SELECT/SHOW/EXPLAIN，连接层强制只读事务。
+    CHECKD_DEMO_DSN="postgresql://..." python tools/m1-server/preflight_snapshot_db.py
 
-不做什么：
-  - 不建库、不 drop 任何东西（清库是不可逆动作，不在预检里做）。
-  - 不假通过。拿不到库就 exit 2，输出 BLOCKED，而不是 exit 0。
+    # 写入型行为测试（造数据 + 清理）。必须 M0 书面批准后加 flag。
+    CHECKD_DEMO_DSN="..." python tools/m1-server/preflight_snapshot_db.py \
+        --behavior-tests --i-have-m0-approval
+
+    # 执行 migration R3。必须 M0 对精确执行计划书面批准。
+    CHECKD_DEMO_DSN="..." python tools/m1-server/preflight_snapshot_db.py \
+        --apply --i-have-m0-approval
+
+## 只读是怎么保证的（三层，不靠文档声称）
+
+1. **连接层**：只读模式下连接串带 `-c default_transaction_read_only=on`，
+   建立连接时即生效，连超级用户也拦（PostgreSQL 的该参数对 superuser 一样生效）。
+2. **语句守卫**：所有查询必须经 `ro_exec()`，它按首关键字白名单放行
+   （select / with / show / explain），并拒绝含写关键字（insert/update/delete/
+   create/alter/drop/grant/truncate/copy/call/do/lock/…）的语句。
+   被拒即抛 ReadOnlyViolation，不会执行。
+3. **实测自证**：连接后真的去 `create temp table` 一次，**必须被数据库拒绝**
+   （SQLSTATE 25006 read_only_sql_transaction）。能建成功 = 只读没生效 → BLOCKED。
+
+对应 2026-11-07 M0 阻断件：旧版第 3–7 节行为测试无条件执行 INSERT/DELETE，
+默认命令并非只读，邮件描述与代码不一致。本版把写操作全部移入
+`behavior_tests()`，且它只能由 `--behavior-tests --i-have-m0-approval` 进入。
+
+## 不做什么
+
+- 不建库、不 drop 任何东西。
+- 不假通过：拿不到库 → exit 2 + BLOCKED，不出任何 PASS。
+- 不打印 DSN 原文（含口令），只打印 host / dbname / user。
 """
 
 import argparse
@@ -23,9 +42,10 @@ import os
 import re
 import sys
 import uuid
+from datetime import datetime, timezone
 
 # M2 12:15 P0-1：原先 dirname(dirname(__file__)) 拼到 tools/db/…，与本文件在
-# tools/m1-server/ 的实际布局不一致，--apply 直接 FileNotFoundError（且 open() 在 try 外会裸崩）。
+# tools/m1-server/ 的实际布局不一致，--apply 直接 FileNotFoundError。
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _CANDIDATES = [
     os.path.join(_HERE, "migrations", "0001_snapshot_r3.sql"),   # 仓库内原地
@@ -34,16 +54,74 @@ _CANDIDATES = [
 ]
 MIGRATION = next((c for c in _CANDIDATES if os.path.exists(c)), _CANDIDATES[0])
 
+# ---------------------------------------------------------------- 只读 SQL 清单
+# 全部只读查询集中在这里，方便人工审计 + 单测逐条过守卫。
+# 注意：权限名（USAGE/CREATE）走参数，不写成 SQL 字面量——否则 'create'
+# 这个字面量会被语句守卫当成写语句。
+RO_SQL = {
+    "conn": "select current_database(), current_user, version()",
+    "pid": "select pg_backend_pid()",
+    "ro_flag": "select current_setting('default_transaction_read_only')",
+    "tables": ("select table_name from information_schema.tables "
+               " where table_schema = %s order by 1"),
+    "constraints": ("select conname from pg_constraint c "
+                    " join pg_namespace n on n.oid = c.connamespace "
+                    " where n.nspname = %s order by 1"),
+    "indexes": "select indexname from pg_indexes where schemaname = %s",
+    "gencol": ("select is_generated, generation_expression "
+               " from information_schema.columns "
+               " where table_schema = %s and table_name = %s and column_name = %s"),
+    "role_exists": "select 1 from pg_roles where rolname = %s",
+    "schema_priv": "select has_schema_privilege(%s, %s, %s)",
+    "table_priv": "select has_table_privilege(%s, %s, %s)",
+}
+
+_ALLOWED_PREFIX = ("select", "with", "show", "explain", "values", "table")
+_WRITE_WORDS = (
+    "insert", "update", "delete", "merge", "truncate", "create", "alter",
+    "drop", "grant", "revoke", "copy", "call", "do", "vacuum", "analyze",
+    "refresh", "comment", "lock", "prepare", "execute", "set", "reset",
+    "discard", "reindex", "cluster", "listen", "notify",
+)
+
+
+class ReadOnlyViolation(RuntimeError):
+    """只读模式下试图执行写语句。"""
+
+
+def is_read_only_sql(sql):
+    """判断一条 SQL 是否只读。保守：宁可误拒，不可误放。"""
+    head = (sql or "").lstrip().lower()
+    if not head.startswith(_ALLOWED_PREFIX):
+        return False, "首关键字不在白名单 %s" % (_ALLOWED_PREFIX,)
+    for w in _WRITE_WORDS:
+        if re.search(r"\b%s\b" % w, head):
+            return False, "含写关键字 %r" % w
+    return True, ""
+
+
+def ro_exec(conn, sql, params=None):
+    """只读执行的唯一入口。守卫不通过就抛异常，绝不执行。"""
+    ok, why = is_read_only_sql(sql)
+    if not ok:
+        raise ReadOnlyViolation("%s | sql=%r" % (why, sql[:120]))
+    if params is None:
+        return conn.execute(sql)
+    return conn.execute(sql, params)
+
+
 RESULTS = []
 
 
-def rec(name, ok, detail=""):
-    RESULTS.append({"check": name, "ok": bool(ok), "detail": str(detail)[:400]})
-    print("  %-42s %s  %s" % (name, "PASS" if ok else "FAIL", str(detail)[:120]))
+def rec(name, ok, detail="", skipped=False):
+    status = "SKIP" if skipped else ("PASS" if ok else "FAIL")
+    RESULTS.append({"check": name, "status": status, "ok": bool(ok) and not skipped,
+                    "detail": str(detail)[:400]})
+    print("  %-46s %-4s  %s" % (name, status, str(detail)[:110]))
 
 
 def safe_dsn(dsn):
-    """只暴露 host / dbname，绝不打印口令。"""
+    """只暴露 host / dbname / user，绝不打印口令。"""
     # 口令里可能含 @（M2 12:15 P2）。从右边找最后一个 @ 才是 host 分隔符。
     m = re.match(r"^([a-z+]+)://(.+)$", dsn)
     if not m:
@@ -59,243 +137,336 @@ def safe_dsn(dsn):
     return {"host": host, "dbname": db, "user": user}
 
 
+def default_out():
+    """写 work/m1/preflight_snapshot_db_result.json（与邮件口径一致）。
+
+    从本文件上溯找名为 work 的目录且其下有 m1/；找不到就落到当前目录。
+    旧版写到 tools/m1-server/ 下，与邮件里说的路径不一致（M0 阻断件第 4 条）。
+    """
+    p = _HERE
+    for _ in range(8):
+        if os.path.basename(p) == "work" and os.path.isdir(os.path.join(p, "m1")):
+            return os.path.join(p, "m1", "preflight_snapshot_db_result.json")
+        parent = os.path.dirname(p)
+        if parent == p:
+            break
+        p = parent
+    return os.path.join(os.getcwd(), "preflight_snapshot_db_result.json")
+
+
+# ------------------------------------------------------------------ 只读检查
+
+
+def check_connection(conn):
+    """第 0 层：连接与只读自证。"""
+    row = ro_exec(conn, RO_SQL["conn"]).fetchone()
+    rec("连接 / 库名", True, "%s as %s" % (row[0], row[1]))
+    ver = row[2].split()[1] if len(row[2].split()) > 1 else "?"
+    parts = tuple(int(x) for x in re.findall(r"\d+", ver)[:2]) or (0,)
+    rec("服务端版本 >= 14", (parts + (0,))[:2] >= (14, 0), ver)
+
+    pid1 = ro_exec(conn, RO_SQL["pid"]).fetchone()[0]
+    pid2 = ro_exec(conn, RO_SQL["pid"]).fetchone()[0]
+    rec("连接后端稳定（非每语句换后端）", pid1 == pid2, "pid=%s/%s" % (pid1, pid2))
+
+    flag = ro_exec(conn, RO_SQL["ro_flag"]).fetchone()[0]
+    rec("连接层只读已开启（default_transaction_read_only）",
+        str(flag).lower() in ("on", "true", "1"), "setting=%s" % flag)
+    return str(flag).lower() in ("on", "true", "1")
+
+
+def prove_read_only(conn):
+    """实测自证：只读事务里建临时表必须被数据库拒绝。
+
+    这是本版的核心证据 —— 不是「文件名带 readonly」，是数据库真的拒绝了写。
+    """
+    try:
+        with conn.transaction():
+            conn.execute("create temp table _checkd_ro_probe(x int)")
+    except Exception as e:                                   # noqa: BLE001
+        st = getattr(getattr(e, "diag", None), "sqlstate", None)
+        ok = st in (None, "25006") or "read-only" in str(e).lower() or "只读" in str(e)
+        rec("写入实测被拒（只读真的生效）", ok,
+            "sqlstate=%s %s" % (st, type(e).__name__))
+        return ok
+    # 不该走到这里
+    try:
+        conn.execute("drop table if exists _checkd_ro_probe")
+    except Exception:                                        # noqa: BLE001
+        pass
+    rec("写入实测被拒（只读真的生效）", False, "临时表居然建成功了——只读未生效")
+    return False
+
+
+def check_schema(conn):
+    """第 2 层：结构存在性（纯元数据查询）。"""
+    tabs = [r[0] for r in ro_exec(conn, RO_SQL["tables"], ("checkd_demo",)).fetchall()]
+    want_tabs = ["applied_change", "proposal", "snapshot", "snapshot_seq"]
+    rec("4 张表齐全", tabs == want_tabs, ",".join(tabs) if tabs else "(schema 为空或不存在)")
+
+    cons = [r[0] for r in ro_exec(conn, RO_SQL["constraints"], ("checkd_demo",)).fetchall()]
+    want = ["applied_change_proposal_fk", "applied_change_proposal_snapshot_fk",
+            "applied_change_proposal_uk", "applied_change_snapshot_fk",
+            "proposal_id_snapshot_uk", "proposal_id_user_uk",
+            "proposal_snapshot_fk", "proposal_ttl_ck",
+            "snapshot_id_user_uk", "snapshot_ttl_ck", "snapshot_version_uk"]
+    missing = [c for c in want if c not in cons]
+    rec("关键约束 11 条", not missing, "缺: %s" % missing if missing else "%d 条" % len(cons))
+
+    idx = [r[0] for r in ro_exec(conn, RO_SQL["indexes"], ("checkd_demo",)).fetchall()]
+    rec("latest 唯一索引存在", "snapshot_one_latest" in idx, ",".join(sorted(idx)) or "(无)")
+    rec("冗余索引 snapshot_lookup 已删", "snapshot_lookup" not in idx, "")
+
+    gen = ro_exec(conn, RO_SQL["gencol"],
+                  ("checkd_demo", "proposal", "base_version")).fetchone()
+    rec("base_version 是生成列（P1-2）",
+        bool(gen) and gen[0] == "ALWAYS", (gen[1] if gen else "列不存在"))
+
+
+def check_privileges(conn):
+    """第 8/9 层：内置角色不该有权限（反向）；应用角色必须**有**权限（正向）。"""
+    for role in ("anon", "authenticated"):
+        if not ro_exec(conn, RO_SQL["role_exists"], (role,)).fetchone():
+            continue
+        has = ro_exec(conn, RO_SQL["schema_priv"],
+                      (role, "checkd_demo", "USAGE")).fetchone()[0]
+        rec("%s 无 schema usage（P2-4）" % role, not has, "has_usage=%s" % has)
+
+    app_role = os.environ.get("CHECKD_APP_ROLE", "checkd_demo_app")
+    if not ro_exec(conn, RO_SQL["role_exists"], (app_role,)).fetchone():
+        rec("应用角色 %s 存在" % app_role, False,
+            "角色不存在——应用连上会 permission denied")
+        return
+    rec("应用角色 %s 存在" % app_role, True, "")
+
+    ok_usage = ro_exec(conn, RO_SQL["schema_priv"],
+                       (app_role, "checkd_demo", "USAGE")).fetchone()[0]
+    rec("应用角色有 schema usage", ok_usage, "usage=%s" % ok_usage)
+
+    for tbl, want in (("snapshot", ("SELECT", "INSERT", "UPDATE")),
+                      ("proposal", ("SELECT", "INSERT", "UPDATE")),
+                      ("applied_change", ("SELECT", "INSERT")),
+                      ("snapshot_seq", ("SELECT", "INSERT", "UPDATE"))):
+        missing = [w for w in want if not ro_exec(
+            conn, RO_SQL["table_priv"],
+            (app_role, "checkd_demo." + tbl, w)).fetchone()[0]]
+        rec("应用角色对 %s 有 %s" % (tbl, "/".join(want)),
+            not missing, "缺: %s" % missing if missing else "齐")
+
+    can_ddl = ro_exec(conn, RO_SQL["schema_priv"],
+                      (app_role, "checkd_demo", "CREATE")).fetchone()[0]
+    rec("应用角色无 create 权（最小权限）", not can_ddl, "create=%s" % can_ddl)
+
+
+# ------------------------------------------------------------------ 写入路径
+# 以下两个函数是全文件唯一的写操作来源，且都只能由显式 flag 进入。
+
+
+def apply_migration(conn):
+    """--apply：执行 migration R3，并验证幂等。需要 M0 书面批准。"""
+    if not os.path.exists(MIGRATION):
+        rec("migration 文件存在", False, MIGRATION)
+        return
+    sql = open(MIGRATION, encoding="utf-8").read()
+    rec("migration 文件存在", True, "%d B" % len(sql.encode("utf-8")))
+    try:
+        # psycopg3 默认走 extended protocol，多语句会报
+        # "cannot insert multiple commands into a prepared statement"。
+        # R3 含多个语句与两个 do $$ 块，必须 prepare=False 走 simple query。
+        conn.execute(sql, prepare=False)
+        rec("migration R3 首次执行", True, "%d B" % len(sql.encode("utf-8")))
+    except Exception as e:                                   # noqa: BLE001
+        rec("migration R3 首次执行", False, "%s: %s" % (type(e).__name__, e))
+        return
+    try:
+        conn.execute(sql, prepare=False)
+        rec("migration R3 重复执行（幂等）", True, "")
+    except Exception as e:                                   # noqa: BLE001
+        rec("migration R3 重复执行（幂等）", False, "%s: %s" % (type(e).__name__, e))
+
+
+def behavior_tests(conn):
+    """--behavior-tests：唯一会写业务表的地方。造数据 → 断言被拒 → 自己清理。
+
+    默认**不进入**。需 `--behavior-tests --i-have-m0-approval` 两条同时给。
+    """
+    uid = "preflight-" + uuid.uuid4().hex[:8]
+
+    # 3 唯一索引挡住第二个 latest
+    try:
+        with conn.transaction():
+            conn.execute("insert into checkd_demo.snapshot "
+                         "(user_id,date_from,date_to,version,payload,payload_digest,"
+                         " payload_bytes,expires_at) "
+                         "values (%s,'2026-11-08','2026-11-10',1,'{}'::jsonb,'x',2,"
+                         " now()+interval '1 hour')", (uid,))
+            conn.execute("insert into checkd_demo.snapshot "
+                         "(user_id,date_from,date_to,version,payload,payload_digest,"
+                         " payload_bytes,expires_at) "
+                         "values (%s,'2026-11-08','2026-11-10',2,'{}'::jsonb,'x',2,"
+                         " now()+interval '1 hour')", (uid,))
+        rec("同区间两个 latest 被拒（唯一索引生效）", False, "两条都插进去了，约束没生效")
+    except Exception as e:                                   # noqa: BLE001
+        ok = "snapshot_one_latest" in str(e) or "duplicate key" in str(e).lower()
+        rec("同区间两个 latest 被拒（唯一索引生效）", ok, type(e).__name__)
+
+    # 4 跨用户复合 FK
+    try:
+        with conn.transaction():
+            sid = conn.execute(
+                "insert into checkd_demo.snapshot "
+                "(user_id,date_from,date_to,version,payload,payload_digest,payload_bytes,"
+                " expires_at) values (%s,'2026-11-08','2026-11-10',3,'{}'::jsonb,'x',2,"
+                " now()+interval '1 hour') returning snapshot_id", (uid,)).fetchone()[0]
+            conn.execute("insert into checkd_demo.proposal "
+                         "(user_id,snapshot_id,snapshot_version,expires_at) "
+                         "values (%s,%s,3, now()+interval '10 min')",
+                         ("preflight-other-" + uuid.uuid4().hex[:6], sid))
+        rec("跨用户 proposal 指向他人 snapshot 被拒", False, "插进去了，P0-1 未生效")
+    except Exception as e:                                   # noqa: BLE001
+        ok = "23503" in str(e) or "foreign key" in str(e).lower()
+        rec("跨用户 proposal 指向他人 snapshot 被拒", ok, type(e).__name__)
+
+    # 5 applied_change 指向不一致被拒（R3 新增 P1）
+    try:
+        with conn.transaction():
+            s1 = conn.execute(
+                "insert into checkd_demo.snapshot (user_id,date_from,date_to,version,"
+                " payload,payload_digest,payload_bytes,expires_at) values "
+                "(%s,'2026-11-08','2026-11-10',4,'{}'::jsonb,'x',2,"
+                " now()+interval '1 hour') returning snapshot_id", (uid,)).fetchone()[0]
+            s2 = conn.execute(
+                "insert into checkd_demo.snapshot (user_id,date_from,date_to,version,"
+                " payload,payload_digest,payload_bytes,expires_at) values "
+                "(%s,'2026-11-08','2026-11-10',5,'{}'::jsonb,'x',2,"
+                " now()+interval '1 hour') returning snapshot_id", (uid,)).fetchone()[0]
+            p = conn.execute(
+                "insert into checkd_demo.proposal "
+                "(user_id,snapshot_id,snapshot_version,expires_at) "
+                "values (%s,%s,4, now()+interval '10 min') returning proposal_id",
+                (uid, s1)).fetchone()[0]
+            conn.execute("insert into checkd_demo.applied_change "
+                         "(proposal_id,user_id,snapshot_id,result) "
+                         "values (%s,%s,%s,'{}'::jsonb)", (p, uid, s2))
+        rec("apply 记录与提案快照不一致被拒（R3 P1）", False, "插进去了，R3 未生效")
+    except Exception as e:                                   # noqa: BLE001
+        ok = "23503" in str(e) or "foreign key" in str(e).lower()
+        rec("apply 记录与提案快照不一致被拒（R3 P1）", ok, type(e).__name__)
+
+    # 6 TTL 早于创建被拒
+    try:
+        with conn.transaction():
+            conn.execute(
+                "insert into checkd_demo.snapshot (user_id,date_from,date_to,version,"
+                " payload,payload_digest,payload_bytes,expires_at) values "
+                "(%s,'2026-11-08','2026-11-10',9,'{}'::jsonb,'x',2, now()-interval '1 min')",
+                (uid,))
+        rec("TTL 早于 created_at 被拒（P2-1）", False, "插进去了，约束没生效")
+    except Exception as e:                                   # noqa: BLE001
+        ok = "snapshot_ttl_ck" in str(e) or "check constraint" in str(e).lower()
+        rec("TTL 早于 created_at 被拒（P2-1）", ok, type(e).__name__)
+
+    # 7 清理自己造的数据
+    with conn.transaction():
+        conn.execute("delete from checkd_demo.applied_change where user_id like 'preflight-%'")
+        conn.execute("delete from checkd_demo.proposal where user_id like 'preflight-%'")
+        conn.execute("delete from checkd_demo.snapshot where user_id like 'preflight-%'")
+        left = conn.execute(
+            "select (select count(*) from checkd_demo.snapshot where user_id like 'preflight-%')"
+            "     + (select count(*) from checkd_demo.proposal where user_id like 'preflight-%')"
+        ).fetchone()[0]
+    rec("预检数据已清理", left == 0, "残留 %s 行" % left)
+
+
+# ---------------------------------------------------------------------- main
+
+
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--apply", action="store_true", help="先执行 migration，再检查")
+    ap = argparse.ArgumentParser(
+        description="checkd 快照库预检（默认只读；写操作必须显式授权）")
+    mode = ap.add_mutually_exclusive_group()
+    mode.add_argument("--behavior-tests", action="store_true",
+                      help="跑写入型行为测试（造数据+清理）。需 --i-have-m0-approval")
+    mode.add_argument("--apply", action="store_true",
+                      help="执行 migration R3。需 --i-have-m0-approval")
     ap.add_argument("--i-have-m0-approval", action="store_true",
-                    help="M0 已对精确执行计划书面批准时才加。没有它 --apply 一律拒绝")
+                    help="M0 已书面批准该写操作时才加")
+    ap.add_argument("--out", default=None, help="结果 JSON 路径")
     args = ap.parse_args()
 
-    # M0 2026-11-07T04:05:25Z §四 明写：未对精确执行计划单独批准前，不得运行 --apply。
-    # 给它一道硬闸，而不是靠我记得。只读检查不需要这道闸。
-    if args.apply and not args.i_have_m0_approval:
-        print("REFUSED: --apply 会写库（建 schema/表 + 插入并删除测试数据）。")
-        print("         M0 工单 §四 要求先提交精确执行计划并获批。")
-        print("         获批后加 --i-have-m0-approval 再跑。只读检查请去掉 --apply。")
+    writes = args.apply or args.behavior_tests
+
+    # 硬闸：任何写路径都必须先拿到 M0 书面批准。
+    if writes and not args.i_have_m0_approval:
+        what = "--apply（DDL）" if args.apply else "--behavior-tests（INSERT/DELETE）"
+        print("REFUSED: %s 会写库。" % what)
+        print("         M0 2026-11-07 阻断件要求：书面批准前不得执行任何写入。")
+        print("         获批后加 --i-have-m0-approval 再跑；只读探测请去掉该参数。")
         return 3
 
     dsn = os.environ.get("CHECKD_DEMO_DSN") or os.environ.get("DATABASE_URL")
     if not dsn:
         print("BLOCKED: 未提供 CHECKD_DEMO_DSN。没有库就不出任何 PASS。")
+        print("         mac/Linux: export CHECKD_DEMO_DSN='postgresql://...'")
+        print("         Windows  : set CHECKD_DEMO_DSN=postgresql://...")
         return 2
 
     try:
         import psycopg
     except ImportError:
-        print("BLOCKED: 缺 psycopg3（pip install 'psycopg[binary]'）。")
+        print("BLOCKED: 缺 psycopg3。安装：python -m pip install 'psycopg[binary]'")
         return 2
 
     info = safe_dsn(dsn)
-    print("目标库: host=%s dbname=%s user=%s" % (info["host"], info["dbname"], info.get("user", "")))
+    print("目标库: host=%s dbname=%s user=%s" % (info["host"], info["dbname"],
+                                                 info.get("user", "")))
+    print("模式: %s" % ("APPLY(写)" if args.apply else
+                       "BEHAVIOR-TESTS(写)" if args.behavior_tests else "READ-ONLY"))
+
+    # 只读模式：连接建立时就把 default_transaction_read_only 打开。
+    # 放在 options 里而不是连上后 SET —— 少一个「先写后读」的窗口。
+    opts = "-c statement_timeout=8000 -c lock_timeout=5000"
+    if not writes:
+        opts += " -c default_transaction_read_only=on"
 
     try:
-        # prepare_threshold=None：6543 PgBouncer transaction mode 下不开预编译缓存
         conn = psycopg.connect(dsn, connect_timeout=8, prepare_threshold=None,
-                               application_name="checkd-preflight",
-                               options="-c statement_timeout=8000 -c lock_timeout=5000")
+                               application_name="checkd-preflight-ro" if not writes
+                               else "checkd-preflight-w",
+                               options=opts)
     except Exception as e:                                   # noqa: BLE001
         print("BLOCKED: 连不上库：%s: %s" % (type(e).__name__, e))
         return 2
 
+    ro_proof = {}
     try:
         with conn:
             conn.autocommit = True
 
-            # ---------- 0 连接层 ----------
-            row = conn.execute("select current_database(), current_user, version()").fetchone()
-            rec("连接 / 库名", True, "%s as %s" % (row[0], row[1]))
-            ver = row[2].split()[1] if len(row[2].split()) > 1 else "?"
-            parts = tuple(int(x) for x in re.findall(r"\d+", ver)[:2]) or (0,)
-            rec("服务端版本 >= 14", (parts + (0,))[:2] >= (14, 0), ver)
-            pid1 = conn.execute("select pg_backend_pid()").fetchone()[0]
-            pid2 = conn.execute("select pg_backend_pid()").fetchone()[0]
-            rec("连接后端稳定（非每语句换后端）", pid1 == pid2, "pid=%s/%s" % (pid1, pid2))
-
-            # ---------- 1 工单要求的迁移可执行 ----------
             if args.apply:
-                if not os.path.exists(MIGRATION):
-                    rec("migration 文件存在", False, MIGRATION)
-                    sql = None
-                else:
-                    sql = open(MIGRATION, encoding="utf-8").read()
-                    rec("migration 文件存在", True, "%d B" % len(sql.encode("utf-8")))
-                try:
-                    if sql is None:
-                        raise FileNotFoundError(MIGRATION)
-                    # P0-2：psycopg3 默认走 extended protocol，多语句会报
-                    # "cannot insert multiple commands into a prepared statement"。
-                    # R3 含多个语句与两个 do $$ 块，必须 prepare=False 走 simple query。
-                    conn.execute(sql, prepare=False)
-                    rec("migration R3 首次执行", True, "%d B" % len(sql.encode("utf-8")))
-                except Exception as e:                       # noqa: BLE001
-                    rec("migration R3 首次执行", False, "%s: %s" % (type(e).__name__, e))
-                # 幂等：再跑一遍必须不报错
-                try:
-                    if sql is None:
-                        raise FileNotFoundError(MIGRATION)
-                    conn.execute(sql, prepare=False)
-                    rec("migration R3 重复执行（幂等）", True, "")
-                except Exception as e:                       # noqa: BLE001
-                    rec("migration R3 重复执行（幂等）", False, "%s: %s" % (type(e).__name__, e))
+                apply_migration(conn)
 
-            # ---------- 2 结构存在性 ----------
-            tabs = [r[0] for r in conn.execute(
-                "select table_name from information_schema.tables "
-                " where table_schema='checkd_demo' order by 1").fetchall()]
-            want_tabs = ["applied_change", "proposal", "snapshot", "snapshot_seq"]
-            rec("4 张表齐全", tabs == want_tabs, ",".join(tabs))
-
-            cons = [r[0] for r in conn.execute(
-                "select conname from pg_constraint c join pg_namespace n on n.oid=c.connamespace "
-                " where n.nspname='checkd_demo' order by 1").fetchall()]
-            want = ["applied_change_proposal_fk", "applied_change_proposal_snapshot_fk",
-                    "applied_change_proposal_uk", "applied_change_snapshot_fk",
-                    "proposal_id_snapshot_uk", "proposal_id_user_uk",
-                    "proposal_snapshot_fk", "proposal_ttl_ck",
-                    "snapshot_id_user_uk", "snapshot_ttl_ck", "snapshot_version_uk"]
-            missing = [c for c in want if c not in cons]
-            rec("关键约束 11 条", not missing, "缺: %s" % missing if missing else "%d 条" % len(cons))
-
-            idx = [r[0] for r in conn.execute(
-                "select indexname from pg_indexes where schemaname='checkd_demo'").fetchall()]
-            rec("latest 唯一索引存在", "snapshot_one_latest" in idx, ",".join(sorted(idx)))
-            rec("冗余索引 snapshot_lookup 已删", "snapshot_lookup" not in idx, "")
-
-            gen = conn.execute(
-                "select is_generated, generation_expression from information_schema.columns "
-                " where table_schema='checkd_demo' and table_name='proposal' "
-                " and column_name='base_version'").fetchone()
-            rec("base_version 是生成列（P1-2）",
-                bool(gen) and gen[0] == "ALWAYS", (gen[1] if gen else "列不存在"))
-
-            # ---------- 3 行为：唯一索引真的挡住第二个 latest ----------
-            uid = "preflight-" + uuid.uuid4().hex[:8]
-            try:
-                with conn.transaction():
-                    conn.execute("insert into checkd_demo.snapshot "
-                                 "(user_id,date_from,date_to,version,payload,payload_digest,"
-                                 " payload_bytes,expires_at) "
-                                 "values (%s,'2026-11-08','2026-11-10',1,'{}'::jsonb,'x',2,"
-                                 " now()+interval '1 hour')", (uid,))
-                    conn.execute("insert into checkd_demo.snapshot "
-                                 "(user_id,date_from,date_to,version,payload,payload_digest,"
-                                 " payload_bytes,expires_at) "
-                                 "values (%s,'2026-11-08','2026-11-10',2,'{}'::jsonb,'x',2,"
-                                 " now()+interval '1 hour')", (uid,))
-                rec("同区间两个 latest 被拒（唯一索引生效）", False, "两条都插进去了，约束没生效")
-            except Exception as e:                           # noqa: BLE001
-                ok = "snapshot_one_latest" in str(e) or "duplicate key" in str(e).lower()
-                rec("同区间两个 latest 被拒（唯一索引生效）", ok, type(e).__name__)
-
-            # ---------- 4 行为：跨用户复合 FK 真的挡住 ----------
-            try:
-                with conn.transaction():
-                    r = conn.execute(
-                        "insert into checkd_demo.snapshot "
-                        "(user_id,date_from,date_to,version,payload,payload_digest,payload_bytes,"
-                        " expires_at) values (%s,'2026-11-08','2026-11-10',3,'{}'::jsonb,'x',2,"
-                        " now()+interval '1 hour') returning snapshot_id", (uid,)).fetchone()
-                    sid = r[0]
-                    # A 用户名的 proposal 去指 B 用户名的 snapshot → 必须被 23503 拒
-                    conn.execute("insert into checkd_demo.proposal "
-                                 "(user_id,snapshot_id,snapshot_version,expires_at) "
-                                 "values (%s,%s,3, now()+interval '10 min')",
-                                 ("preflight-other-" + uuid.uuid4().hex[:6], sid))
-                rec("跨用户 proposal 指向他人 snapshot 被拒", False, "插进去了，P0-1 未生效")
-            except Exception as e:                           # noqa: BLE001
-                ok = "23503" in str(e) or "foreign key" in str(e).lower()
-                rec("跨用户 proposal 指向他人 snapshot 被拒", ok, type(e).__name__)
-
-            # ---------- 5 行为：applied_change 指向不一致被拒（R3 新增 P1）----------
-            try:
-                with conn.transaction():
-                    s1 = conn.execute(
-                        "insert into checkd_demo.snapshot (user_id,date_from,date_to,version,"
-                        " payload,payload_digest,payload_bytes,expires_at) values "
-                        "(%s,'2026-11-08','2026-11-10',4,'{}'::jsonb,'x',2,"
-                        " now()+interval '1 hour') returning snapshot_id", (uid,)).fetchone()[0]
-                    s2 = conn.execute(
-                        "insert into checkd_demo.snapshot (user_id,date_from,date_to,version,"
-                        " payload,payload_digest,payload_bytes,expires_at) values "
-                        "(%s,'2026-11-08','2026-11-10',5,'{}'::jsonb,'x',2,"
-                        " now()+interval '1 hour') returning snapshot_id", (uid,)).fetchone()[0]
-                    p = conn.execute(
-                        "insert into checkd_demo.proposal "
-                        "(user_id,snapshot_id,snapshot_version,expires_at) "
-                        "values (%s,%s,4, now()+interval '10 min') returning proposal_id",
-                        (uid, s1)).fetchone()[0]
-                    # 提案基于 s1，apply 却记 s2 → R3 的复合 FK 必须拒
-                    conn.execute("insert into checkd_demo.applied_change "
-                                 "(proposal_id,user_id,snapshot_id,result) "
-                                 "values (%s,%s,%s,'{}'::jsonb)", (p, uid, s2))
-                rec("apply 记录与提案快照不一致被拒（R3 P1）", False, "插进去了，R3 未生效")
-            except Exception as e:                           # noqa: BLE001
-                ok = "23503" in str(e) or "foreign key" in str(e).lower()
-                rec("apply 记录与提案快照不一致被拒（R3 P1）", ok, type(e).__name__)
-
-            # ---------- 6 行为：TTL 早于创建被拒（P2-1）----------
-            try:
-                with conn.transaction():
-                    conn.execute(
-                        "insert into checkd_demo.snapshot (user_id,date_from,date_to,version,"
-                        " payload,payload_digest,payload_bytes,expires_at) values "
-                        "(%s,'2026-11-08','2026-11-10',9,'{}'::jsonb,'x',2, now()-interval '1 min')",
-                        (uid,))
-                rec("TTL 早于 created_at 被拒（P2-1）", False, "插进去了，约束没生效")
-            except Exception as e:                           # noqa: BLE001
-                ok = "snapshot_ttl_ck" in str(e) or "check constraint" in str(e).lower()
-                rec("TTL 早于 created_at 被拒（P2-1）", ok, type(e).__name__)
-
-            # ---------- 7 清理自己造的数据 ----------
-            with conn.transaction():
-                conn.execute("delete from checkd_demo.applied_change where user_id like 'preflight-%'")
-                conn.execute("delete from checkd_demo.proposal where user_id like 'preflight-%'")
-                conn.execute("delete from checkd_demo.snapshot where user_id like 'preflight-%'")
-                left = conn.execute(
-                    "select (select count(*) from checkd_demo.snapshot where user_id like 'preflight-%')"
-                    "     + (select count(*) from checkd_demo.proposal where user_id like 'preflight-%')"
-                ).fetchone()[0]
-            rec("预检数据已清理", left == 0, "残留 %s 行" % left)
-
-            # ---------- 8 权限（P2-4）----------
-            for role in ("anon", "authenticated"):
-                exists = conn.execute("select 1 from pg_roles where rolname=%s", (role,)).fetchone()
-                if not exists:
-                    continue
-                has = conn.execute(
-                    "select has_schema_privilege(%s,'checkd_demo','usage')", (role,)).fetchone()[0]
-                rec("%s 无 schema usage（P2-4）" % role, not has, "has_usage=%s" % has)
-
-            # ---------- 9 应用角色必须**有**权限（M2 12:15 P0-3）----------
-            # 上面只验了"内置角色没有权限"（反向）。真正会让应用挂掉的是：
-            # 应用角色自己没权限，而 preflight 全绿 —— 这个洞必须正向验一遍。
-            app_role = os.environ.get("CHECKD_APP_ROLE", "checkd_demo_app")
-            has_role = conn.execute("select 1 from pg_roles where rolname=%s",
-                                    (app_role,)).fetchone()
-            if not has_role:
-                rec("应用角色 %s 存在" % app_role, False, "角色不存在——应用连上会 permission denied")
+            ro_on = check_connection(conn)
+            if writes:
+                rec("只读自证（写模式跳过）", True, "写模式不做只读断言", skipped=True)
+                ro_proof = {"applicable": False}
+            elif not ro_on:
+                rec("只读自证", False, "连接未处于只读，停止后续检查")
+                ro_proof = {"applicable": True, "conn_setting": "off"}
             else:
-                rec("应用角色 %s 存在" % app_role, True, "")
-                try:
-                    ok_usage = conn.execute(
-                        "select has_schema_privilege(%s,'checkd_demo','usage')",
-                        (app_role,)).fetchone()[0]
-                    rec("应用角色有 schema usage", ok_usage, "usage=%s" % ok_usage)
-                    for tbl, want in (("snapshot", ("select", "insert", "update")),
-                                      ("proposal", ("select", "insert", "update")),
-                                      ("applied_change", ("select", "insert")),
-                                      ("snapshot_seq", ("select", "insert", "update"))):
-                        missing = [w for w in want if not conn.execute(
-                            "select has_table_privilege(%s,%s,%s)",
-                            (app_role, "checkd_demo." + tbl, w)).fetchone()[0]]
-                        rec("应用角色对 %s 有 %s" % (tbl, "/".join(want)),
-                            not missing, "缺: %s" % missing if missing else "齐")
-                    can_ddl = conn.execute(
-                        "select has_schema_privilege(%s,'checkd_demo','create')",
-                        (app_role,)).fetchone()[0]
-                    rec("应用角色无 create 权（最小权限）", not can_ddl, "create=%s" % can_ddl)
-                except Exception as e:                   # noqa: BLE001
-                    rec("应用角色权限检查", False, "%s: %s" % (type(e).__name__, e))
+                proved = prove_read_only(conn)
+                ro_proof = {"applicable": True, "conn_setting": "on",
+                            "write_probe_refused": bool(proved)}
+
+            check_schema(conn)
+            check_privileges(conn)
+
+            if args.behavior_tests:
+                behavior_tests(conn)
+            else:
+                rec("写入型行为测试（唯一索引/FK/TTL 实拍）", True,
+                    "未执行：需 --behavior-tests --i-have-m0-approval（默认跳过）",
+                    skipped=True)
 
     finally:
         try:
@@ -303,19 +474,36 @@ def main():
         except Exception:                                    # noqa: BLE001
             pass
 
-    passed = sum(1 for r in RESULTS if r["ok"])
-    total = len(RESULTS)
-    print("\n合计 %d/%d PASS" % (passed, total))
-    out = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                       "preflight_snapshot_db_result.json")
+    passed = sum(1 for r in RESULTS if r["status"] == "PASS")
+    failed = sum(1 for r in RESULTS if r["status"] == "FAIL")
+    skipped = sum(1 for r in RESULTS if r["status"] == "SKIP")
+
+    print("\n合计 PASS %d / FAIL %d / SKIP %d（共 %d 项）"
+          % (passed, failed, skipped, len(RESULTS)))
+
+    out = args.out or default_out()
+    try:
+        os.makedirs(os.path.dirname(out), exist_ok=True)
+    except Exception:                                        # noqa: BLE001
+        pass
+    payload = {
+        "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "mode": "apply" if args.apply else
+                "behavior-tests" if args.behavior_tests else "read-only",
+        "target": info,
+        "read_only_proof": ro_proof,
+        "write_statements_allowed": bool(writes),
+        "passed": passed, "failed": failed, "skipped": skipped, "total": len(RESULTS),
+        "results": RESULTS,
+    }
     with open(out, "w", encoding="utf-8", newline="\n") as f:
-        json.dump({"generated_at": __import__("datetime").datetime.now(
-            __import__("datetime").timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "target": info, "passed": passed, "total": total,
-            "results": RESULTS}, f, ensure_ascii=False, indent=2)
+        json.dump(payload, f, ensure_ascii=False, indent=2)
         f.write("\n")
-    print("结果已写入 %s" % out)
-    return 0 if passed == total else 1
+    print("结果已写入 %s" % os.path.abspath(out))
+
+    if failed:
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
