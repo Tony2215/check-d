@@ -26,6 +26,7 @@
 import importlib
 import json
 import os
+import re
 import sys
 import threading
 import time
@@ -61,11 +62,32 @@ DEMO_TOKEN = os.environ.get("CHECKD_DEMO_TOKEN", "")
 # 平台内部读到也拿不到可用凭证。
 #
 # 逗号分隔，支持多个 —— 每个调用方各自轮换，互不影响。
-DEMO_TOKEN_SHA256 = tuple(
-    x.strip().lower()
-    for x in os.environ.get("CHECKD_DEMO_TOKEN_SHA256", "").split(",")
-    if x.strip()
-)
+#
+# 只接受 64 位小写十六进制，其余一律丢弃并告警。
+# 起因：M2 2026-11-08 19:19 报 P1 —— 配置侧写进非 ASCII 时，比对循环里的
+# want.encode("ascii") 会抛 UnicodeEncodeError，客户端拿到的是**空应答**（curl 52），
+# 既不是 401 也不是 503。那等于把一个配置笔误放大成「服务不可用」，
+# 排查时还会误以为是网络问题。在启动阶段就过滤，非法项永远进不了比对循环。
+_SHA256_RE = re.compile(r"[0-9a-f]{64}")
+
+
+def _parse_sha256_list(raw):
+    good, bad = [], []
+    for piece in raw.split(","):
+        piece = piece.strip().lower()
+        if not piece:
+            continue
+        if _SHA256_RE.fullmatch(piece):
+            good.append(piece)
+        else:
+            bad.append(len(piece))     # 只记长度，绝不把疑似口令的内容打到日志
+    for n in bad:
+        sys.stderr.write(
+            "WARN: CHECKD_DEMO_TOKEN_SHA256 含 %d 字符的非法项（须为 64 位十六进制），已丢弃。\n" % n)
+    return tuple(good)
+
+
+DEMO_TOKEN_SHA256 = _parse_sha256_list(os.environ.get("CHECKD_DEMO_TOKEN_SHA256", ""))
 
 ADMIN_KEY = os.environ.get("CHECKD_ADMIN_KEY", "")
 # 口令通过后固定使用的演示身份；不对外暴露 mock 内部 token

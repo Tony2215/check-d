@@ -237,19 +237,78 @@ class TestFailClosed(unittest.TestCase):
             srv.stop()
 
 
-class TestDigestParsing(unittest.TestCase):
-    """不改进程、只校验解析规则本身。"""
+class TestNonAsciiDigest(unittest.TestCase):
+    """M2 2026-11-08 19:19 报的 P1：配置里含非 ASCII，客户端拿到空应答而非 401/503。
 
-    def _parse(self, raw):
-        return tuple(x.strip().lower() for x in raw.split(",") if x.strip())
+    根因：比对循环 `want.encode("ascii")` 抛 UnicodeEncodeError，异常逃出 handler，
+    连接被直接断掉，curl 报 52（empty reply）。一个配置笔误被放大成「服务不可用」，
+    排查时还会误判成网络问题。修法是启动阶段就过滤，非法项进不了循环。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.srv = _Server(CHECKD_DEMO_TOKEN_SHA256="指纹不是hex")
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.srv.stop()
+
+    def test_returns_503_not_empty_reply(self):
+        code, body = self.srv.call("anything")
+        self.assertEqual(code, 503, body)
+        self.assertEqual(body["error"]["code"], "DEPENDENCY_UNAVAILABLE")
+
+
+class TestMixedValidAndInvalidDigest(unittest.TestCase):
+    """非法项被丢弃后，合法的那条必须照常工作。"""
+
+    TOKEN = "survivor-token-7788"
+
+    @classmethod
+    def setUpClass(cls):
+        cls.srv = _Server(CHECKD_DEMO_TOKEN_SHA256="乱码,%s,xyz" % _sha(cls.TOKEN))
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.srv.stop()
+
+    def test_valid_digest_still_works(self):
+        self.assertEqual(self.srv.call(self.TOKEN)[0], 200)
+
+
+class TestDigestParsing(unittest.TestCase):
+    """解析规则本身。直接测 app.py 里的真函数，不另写一份副本。"""
+
+    @classmethod
+    def setUpClass(cls):
+        for p in (SRC_DIR, MOCK_DIR):
+            if p not in sys.path:
+                sys.path.insert(0, p)
+        import app as _app
+        cls.parse = staticmethod(_app._parse_sha256_list)
 
     def test_strips_and_lowercases(self):
         h = _sha("x")
-        self.assertEqual(self._parse("  %s  " % h.upper()), (h,))
+        self.assertEqual(self.parse("  %s  " % h.upper()), (h,))
 
     def test_drops_empty_pieces(self):
         h1, h2 = _sha("a"), _sha("b")
-        self.assertEqual(self._parse("%s,,%s," % (h1, h2)), (h1, h2))
+        self.assertEqual(self.parse("%s,,%s," % (h1, h2)), (h1, h2))
+
+    def test_rejects_non_ascii(self):
+        self.assertEqual(self.parse("指纹不是hex"), ())
+
+    def test_rejects_wrong_length(self):
+        h = _sha("x")
+        self.assertEqual(self.parse(h[:63]), ())
+        self.assertEqual(self.parse(h + "0"), ())
+
+    def test_rejects_non_hex(self):
+        self.assertEqual(self.parse("z" * 64), ())
+
+    def test_keeps_valid_among_invalid(self):
+        h = _sha("ok")
+        self.assertEqual(self.parse("乱码,%s,abc" % h), (h,))
 
 
 if __name__ == "__main__":
