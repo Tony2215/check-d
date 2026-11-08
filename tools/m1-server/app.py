@@ -9,9 +9,10 @@
    不在这里长第二套逻辑。
 2. 只绑回环。默认 BIND=127.0.0.1；只有部署到平台沙箱时才由启动命令显式传
    BIND=0.0.0.0。绝不在本机默认对外监听。
-3. 鉴权失败即关闭（fail-closed）。未设置 CHECKD_DEMO_TOKEN 时，所有业务端点
-   返回 503，不给"先跑起来再补密码"的空间。未设置 CHECKD_ADMIN_KEY 时，
-   reset 与 evidence 端点整体禁用。
+3. 鉴权失败即关闭（fail-closed）。CHECKD_DEMO_TOKEN 与 CHECKD_DEMO_TOKEN_SHA256
+   都未设置时，所有业务端点返回 503，不给"先跑起来再补密码"的空间。
+   两者任一已设即可工作；指纹模式见 DEMO_TOKEN_SHA256 处的说明。
+   未设置 CHECKD_ADMIN_KEY 时，reset 与 evidence 端点整体禁用。
 4. 对外只认一把随机口令，内部演示身份与口令解耦。口令匹配后固定以演示用户
    身份调用工具，mock 自带的 demo-token-alice/bob 不出现在任何对外文案里。
 5. HTTP 状态取自契约 §4.1 的 21 码表（errors.py，M3 已复验）。未知码不包装成
@@ -31,6 +32,7 @@ import time
 import traceback
 import uuid
 import hmac
+import hashlib
 from collections import deque
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -47,6 +49,24 @@ SERVICE_NAME = "checkd-agent-tools"
 SERVICE_VERSION = "1.0.0"
 
 DEMO_TOKEN = os.environ.get("CHECKD_DEMO_TOKEN", "")
+
+# 方案 A（2026-11-08，M0 15:55 询问后定）：允许只配置**口令的指纹**，不配置明文。
+#
+# 起因：共享口令要求「服务端与调用方持有同一个字符串」，而「同一个」只能靠传输。
+# M0 同时要求「任何渠道不得出现明文」，于是三条一起构成死锁——不是流程没写细，
+# 是共享口令这个机制本身走不通。
+#
+# 改成存指纹：调用方自持明文，服务端只拿来访值算一遍 SHA-256 去比。
+# 指纹泄露造不出口令（SHA-256 不可逆），因此部署目录里即便留的是指纹，
+# 平台内部读到也拿不到可用凭证。
+#
+# 逗号分隔，支持多个 —— 每个调用方各自轮换，互不影响。
+DEMO_TOKEN_SHA256 = tuple(
+    x.strip().lower()
+    for x in os.environ.get("CHECKD_DEMO_TOKEN_SHA256", "").split(",")
+    if x.strip()
+)
+
 ADMIN_KEY = os.environ.get("CHECKD_ADMIN_KEY", "")
 # 口令通过后固定使用的演示身份；不对外暴露 mock 内部 token
 DEMO_USER_TOKEN = os.environ.get("CHECKD_DEMO_USER", "demo-token-alice")
@@ -695,7 +715,8 @@ class Handler(BaseHTTPRequestHandler):
         return out
 
     def _auth_ok(self):
-        if not DEMO_TOKEN:
+        # 明文与指纹任一配置即可工作（方案 A：两者并行，不破坏既有能力）。
+        if not DEMO_TOKEN and not DEMO_TOKEN_SHA256:
             self._fail(503, "DEPENDENCY_UNAVAILABLE",
                        "服务未配置访问口令，已按失败即关闭处理。")
             return False
@@ -709,10 +730,18 @@ class Handler(BaseHTTPRequestHandler):
                        details=[{"field": "X-Demo-Token", "reason": "missing"}])
             return False
         # 常量时间比对：逐个候选走 compare_digest，不用 in / == 提前返回。
+        # 方案 A：明文命中 或 指纹命中，都算通过。
         ok = False
         for cand in cands:
-            if hmac.compare_digest(cand, DEMO_TOKEN):
+            if DEMO_TOKEN and hmac.compare_digest(cand, DEMO_TOKEN):
                 ok = True
+            if DEMO_TOKEN_SHA256:
+                # 用 bytes 比较：指纹是纯 ASCII，但候选值可能含非 ASCII
+                # （请求头被塞了奇怪内容），str 版 compare_digest 会抛 TypeError 变 500。
+                got = hashlib.sha256(cand.encode("utf-8", "surrogatepass")).hexdigest()
+                for want in DEMO_TOKEN_SHA256:
+                    if hmac.compare_digest(got.encode("ascii"), want.encode("ascii")):
+                        ok = True
         if not ok:
             self._fail(401, "APPROVAL_UNTRUSTED", "凭证无效。",
                        details=[{"field": "X-Demo-Token", "reason": "invalid"}])
@@ -754,7 +783,7 @@ class Handler(BaseHTTPRequestHandler):
                 "mock_version": getattr(mock, "SERVER_VERSION", "?"),
                 "tool_count": len(mock.TOOLS),
                 "auth_required": True,
-                "auth_configured": bool(DEMO_TOKEN),
+                "auth_configured": bool(DEMO_TOKEN or DEMO_TOKEN_SHA256),
                 "admin_configured": bool(ADMIN_KEY),
                 # M0 2026-11-07 令 D：删掉 token_sha8 / admin_sha8。口令指纹即便不可逆，
                 # 也让人可以离线比对字典，且对运维没有用处（要验「变量进没进来」只看
@@ -985,8 +1014,9 @@ def main():
     port = int(os.environ.get("PORT", "8790"))
     _STATS["starts_at"] = _now()
 
-    if not DEMO_TOKEN:
-        sys.stderr.write("WARN: CHECKD_DEMO_TOKEN 未设置，业务端点将全部拒答（fail-closed）。\n")
+    if not DEMO_TOKEN and not DEMO_TOKEN_SHA256:
+        sys.stderr.write("WARN: CHECKD_DEMO_TOKEN / CHECKD_DEMO_TOKEN_SHA256 均未设置，"
+                         "业务端点将全部拒答（fail-closed）。\n")
     if not ADMIN_KEY:
         sys.stderr.write("WARN: CHECKD_ADMIN_KEY 未设置，reset/evidence 已禁用。\n")
     if bind not in ("127.0.0.1", "localhost", "::1"):
