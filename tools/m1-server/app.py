@@ -449,6 +449,10 @@ def _snapshot_dispatch(name, args, trace, started):
             _sanitize_explanations(body)
             if not body.get("trace_id"):
                 body["trace_id"] = trace
+            # 快照来自库，但仍是演示数据，不是真实 App 数据 ——
+            # source 二值里属 mock，具体来源用 data_source 区分（M3 P1-b）。
+            body["source"] = "mock"
+            body["data_source"] = "snapshot"
             status = 200
             ok = True
         except Exception as exc:                             # noqa: BLE001
@@ -488,12 +492,76 @@ def _snapshot_dispatch(name, args, trace, started):
     return status, body, entry
 
 
+def _validate_input(name, args):
+    """按 tool_server.SCHEMAS 校验 input —— schema 写了的，服务端必须真执行。
+
+    M3 2026-11-09T12:56:42Z 报 P1-b：`input` 里塞 `engine:"real"` 被静默接受，
+    还返回一份**看不出是 MOCK** 的成功结果。schema 明写 `additionalProperties: false`，
+    服务端却从未执行 —— 声明与实现脱节比不写 schema 更糟：调用方会以为被校验了。
+
+    P2 是同一根因：`get_approval_status` 传 `proposal_id`（schema 要 `approval_id`）
+    报 `NOT_FOUND` 而非 `INVALID_ARGUMENT`，现场调试分不清「参数错」还是「状态丢了」。
+    未知字段一律在这里拦住，两条一起解决。
+
+    只校验 `input` 内部：`SCHEMAS[name]` 描述的就是这一层（顶层信封另有其校验）。
+    没有 schema 的工具不拦，保持原行为。
+    """
+    spec = mock.SCHEMAS.get(name)
+    if not isinstance(spec, dict):
+        return None
+
+    inp = args.get("input")
+    if inp is None:
+        if spec.get("required"):
+            return ("INVALID_ARGUMENT", "缺少必填字段 input。",
+                    [{"field": "input", "reason": "missing"}])
+        return None
+    if not isinstance(inp, dict):
+        return ("INVALID_ARGUMENT", "input 必须是对象。",
+                [{"field": "input", "reason": "not_object"}])
+
+    props = spec.get("properties") or {}
+    if spec.get("additionalProperties") is False:
+        extra = sorted(str(k) for k in inp if k not in props)
+        if extra:
+            return ("INVALID_ARGUMENT",
+                    "input 含未定义字段：%s（该工具只接受 %s）。"
+                    % (", ".join(extra), ", ".join(sorted(props)) or "无"),
+                    [{"field": k, "reason": "unknown_field"} for k in extra])
+
+    missing = sorted(k for k in (spec.get("required") or []) if k not in inp)
+    if missing:
+        return ("INVALID_ARGUMENT",
+                "input 缺少必填字段：%s。" % ", ".join(missing),
+                [{"field": k, "reason": "missing"} for k in missing])
+    return None
+
+
 def _call(name, args):
     """调用一个工具，返回 (http_status, body, evidence_entry)。"""
     started = time.time()
     trace = uuid.uuid4().hex[:16]
     ok = False
     code = None
+
+    # 参数校验先于一切副作用：schema 声明了 additionalProperties:false，
+    # 就必须在进入工具前拦住未知字段（M3 P1-b / P2）。
+    bad = _validate_input(name, args)
+    if bad is not None:
+        vcode, vmsg, vdetails = bad
+        body = errs.to_envelope(
+            vcode, vmsg,
+            request_id=(args or {}).get("request_id") if isinstance(args, dict) else None,
+            trace_id=trace, details=vdetails)
+        body["source"] = "mock"          # 没进任何数据源，但归属仍是 mock 服务
+        entry = {"ts": _now(), "trace_id": trace, "tool": name, "arguments": args,
+                 "ok": False, "error_code": vcode, "duration_ms": 0,
+                 "gate": "input_schema"}
+        with _LOCK:
+            _STATS["calls"] += 1
+            _STATS["errors"] += 1
+            _EVIDENCE.append(entry)
+        return errs.http_status(vcode), body, entry
 
     # 快照闸：仅在 CHECKD_SNAPSHOT_MODE=on 时生效。
     # 开了就必须真——库不可用一律 503，绝不悄悄回退 mock（M0 §三）。
@@ -532,6 +600,12 @@ def _call(name, args):
             status = errs.http_status(code) if errs.is_known_code(code) else 500
         if not body.get("trace_id"):
             body["trace_id"] = trace
+        # M0 2026-11-09T10:51 「必须清晰区分 REAL-READ / MOCK-SCHEDULE / REAL-WRITE」。
+        # M3 P1-b 实测：generate 载荷里 mock 出现 0 次，唯一可辨识痕迹是 approval_url 的域名 ——
+        # 靠域名猜是不是 MOCK 太脆，直接在顶层给出来源，调用方与验收方都不必推断。
+        # source 只用二值 mock/real（M3 的断言按这个写）；更细的来源放 data_source。
+        body["source"] = "mock"
+        body["data_source"] = "builtin"
     except Exception:
         sys.stderr.write("tool %s crashed:\n%s" % (name, traceback.format_exc()))
         code = "INTERNAL_ERROR"

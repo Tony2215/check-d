@@ -263,3 +263,57 @@ host/dbname/user 三项（**不含 DSN**）。退出码 2 = 没拿到库或缺 p
 
 要判断"某个改动在不在远端"，就问一句：它在**当前 HEAD 的 tree** 里吗？
 在，就已经推出去了。
+
+## 十一、为什么公网永远测不到 `reason=missing`
+
+M3 2026-11-09T12:56:42Z 报「缺口令没有按工单报 missing，不带头也返 invalid」。
+**代码没错，环境使然**，这里把原因和判据一起写死，免得每次验收都重新争一遍。
+
+`app.py` 的 `_auth_ok()` 里有 missing 分支：
+
+```python
+if not cands:
+    self._fail(401, "APPROVAL_UNTRUSTED", "缺少访问凭证…",
+               details=[{"field": "X-Demo-Token", "reason": "missing"}])
+```
+
+但 `_candidates()` **同时收集两个头**（代码注释原文：「平台反代会注入/覆盖这个头」）：
+
+- `X-Demo-Token`
+- `Authorization`（`Bearer xxx` 会去掉前缀后入列）
+
+**平台反向代理会给每个请求注入 `Authorization`**，所以 `cands` 永远非空
+→ 一定走到 `reason=invalid`，`missing` 分支在公网不可达。
+
+| 访问方式 | 期望结果 | 说明 |
+|---|---|---|
+| 经公网网关，完全不带任何凭证 | 401 + `reason=invalid` | **这是正常现象，不是部署件旧** |
+| 直连容器/本机，完全不带任何凭证 | 401 + `reason=missing`（约 301 B） | 不经反代才有 missing |
+| 经公网，带错口令 | 401 + `reason=invalid` | 与上一行响应体不同处仅在 details |
+
+**验收判据请按上表写**。要验 missing 分支，必须**绕过反代**直连；拿公网结果验 missing 永远验不到。
+
+## 十二、输入校验与来源标注（2026-11-09 收 M3 P1-b / P2 后新增）
+
+**参数校验在 `_call()` 最前面，先于任何副作用。**
+`tool_server.SCHEMAS[name]` 描述的是 `input` 这一层，服务端现在**真的执行**它：
+
+- `additionalProperties: false` → `input` 顶层出现未定义字段即 `INVALID_ARGUMENT`
+- `required` 缺字段 → `INVALID_ARGUMENT`
+- 例子：`generate_schedule` 的 `input` 里塞 `engine: "real"` → **400 / INVALID_ARGUMENT**，不进工具
+- 例子：`get_approval_status` 传 `proposal_id`（schema 要 `approval_id`）→ **400 / INVALID_ARGUMENT**，
+  不再报 `NOT_FOUND`（那个错法会让现场把「参数名写错」误诊成「状态丢了」）
+
+**已知边界**：只校验 `input` 顶层，**不递归**校验嵌套对象（`date_range` 内部塞未知字段仍放行）。
+两侧都在 `tests/test_input_schema_and_source.py` 里钉了用例，包括那条「嵌套未拦」的边界本身。
+
+**来源标注**：所有工具响应顶层都带两个字段
+
+| 字段 | 取值 | 含义 |
+|---|---|---|
+| `source` | `mock` / `real` | 数据是不是真实 App 数据。**当前所有路径均为 `mock`** |
+| `data_source` | `builtin` / `snapshot` | mock 内部的细分：内置 4 条常量 / 库里的快照 |
+
+为什么必须显式给：M0 2026-11-09T10:51 要求「必须清晰区分 REAL-READ / MOCK-SCHEDULE / REAL-WRITE」，
+而 M3 实测 `generate` 载荷里 `mock` 出现 **0 次**，唯一可辨识痕迹是 `approval_url` 的域名——
+靠域名去猜是不是假数据太脆，验收方不该做这种推断。
