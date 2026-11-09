@@ -365,5 +365,73 @@ class TestProvenance(unittest.TestCase):
                          "week_expansion_not_implemented_here")
 
 
+
+class TestDailyOverrides(unittest.TestCase):
+    """单日例外（临时停课/调课）。
+
+    真实表 `daily_item_overrides`，`item_type` 库里是 `oneTime`。
+    早先 `get_calendar_events` 是「先查 courses，空了就 return」——
+    一个没录课程、只给任务设了例外的用户，例外会被整片丢掉。
+    """
+
+    ROWS = [
+        {"id": "ov-1", "item_type": "oneTime", "item_id": "uuid-t1",
+         "local_date": "2026-11-10", "action": "skip",
+         "planned_start_minute": None, "planned_end_minute": None},
+        {"id": "ov-2", "item_type": "course", "item_id": "uuid-c1",
+         "local_date": "2026-11-11", "action": "reschedule",
+         "planned_start_minute": 600, "planned_end_minute": 700},
+    ]
+
+    def test_overrides_are_returned_and_renamed(self):
+        r, _ = reader({"courses": (200, [COURSE_ROW]),
+                       "daily_item_overrides": (200, self.ROWS)})
+        out = rr.RealRead(r).get_calendar_events("2026-11-09", "2026-11-15")
+        self.assertEqual(len(out["daily_overrides"]), 2)
+        first = out["daily_overrides"][0]
+        self.assertEqual(first["override_id"], "ov-1")
+        # oneTime → one_time，与 week_rule_type 同一类转换
+        self.assertEqual(first["item_type"], "one_time")
+        self.assertEqual(first["action"], "skip")
+        self.assertEqual(out["daily_overrides"][1]["item_type"], "course")
+
+    def test_overrides_read_even_without_courses(self):
+        """没有课程也必须读例外。这是之前会被短路漏掉的场景。"""
+        r, t = reader({"courses": (200, []),
+                       "daily_item_overrides": (200, self.ROWS)})
+        out = rr.RealRead(r).get_calendar_events("2026-11-09", "2026-11-15")
+        self.assertEqual(out["courses"], [])
+        self.assertEqual(len(out["daily_overrides"]), 2)
+        self.assertIn("daily_item_overrides", t.tables_called())
+
+    def test_overrides_filtered_by_window(self):
+        """按 local_date 过滤，不把整张历史拉下来。"""
+        r, t = reader({"courses": (200, []),
+                       "daily_item_overrides": (200, [])})
+        rr.RealRead(r).get_calendar_events("2026-11-09", "2026-11-15")
+        url = t.table_url("daily_item_overrides")
+        self.assertIn("gte.2026-11-09", url)
+        self.assertIn("lte.2026-11-15", url)
+        self.assertIn("deleted_at", url)
+
+    def test_unknown_item_type_refuses_to_guess(self):
+        r, _ = reader({"courses": (200, []),
+                       "daily_item_overrides": (200, [dict(
+                           self.ROWS[0], item_type="someFutureType")])})
+        with self.assertRaises(rr.RealReadError) as ctx:
+            rr.RealRead(r).get_calendar_events("2026-11-09", "2026-11-15")
+        self.assertEqual(ctx.exception.code, "INTERNAL_ERROR")
+        self.assertIn("item_type", json.dumps(ctx.exception.details))
+
+    def test_no_private_columns_requested(self):
+        r, t = reader({"courses": (200, []),
+                       "daily_item_overrides": (200, [])})
+        rr.RealRead(r).get_calendar_events("2026-11-09", "2026-11-15")
+        url = t.table_url("daily_item_overrides")
+        for col in ("notes", "temporary_classroom", "reminder_minute_of_day",
+                    "target_duration_seconds", "user_id"):
+            self.assertNotIn(col, url, "单日例外查询里出现了非白名单列 %s" % col)
+
+
 if __name__ == "__main__":
     unittest.main()

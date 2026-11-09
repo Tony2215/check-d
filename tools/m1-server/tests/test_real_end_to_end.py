@@ -78,6 +78,12 @@ FIXTURE_COURSES = [
      "semester": "2026秋", "updated_at": "2026-11-09T06:00:00+08:00"},
 ]
 
+FIXTURE_OVERRIDES = [
+    {"id": "fixture-override-1", "item_type": "oneTime",
+     "item_id": "fixture-task-exact", "local_date": "2026-11-10",
+     "action": "skip", "planned_start_minute": None, "planned_end_minute": None},
+]
+
 FIXTURE_RULES = [
     {"id": "fixture-rule-1", "course_id": "fixture-course-1", "weekday": 4,
      "week_rule_type": "everyWeek", "start_week": 1, "end_week": 16,
@@ -92,6 +98,7 @@ _ROUTE = {
     "task_schedules": FIXTURE_SCHEDULES,
     "courses": FIXTURE_COURSES,
     "course_schedule_rules": FIXTURE_RULES,
+    "daily_item_overrides": FIXTURE_OVERRIDES,
 }
 
 
@@ -292,6 +299,25 @@ class TestEndToEndRead(unittest.TestCase):
         self.assertEqual(data["events"], [])
         self.assertEqual(data["events_unavailable_reason"],
                          "week_expansion_not_implemented_here")
+
+    def test_daily_overrides_travel_through(self):
+        """单日例外必须真的读出来并改名，不能在端到端里丢。"""
+        code, body = self.stack.call("get_calendar_events")
+        self.assertEqual(code, 200, body)
+        ovs = body["data"]["daily_overrides"]
+        self.assertEqual(len(ovs), 1)
+        self.assertEqual(ovs[0]["item_type"], "one_time")   # oneTime → one_time
+        self.assertEqual(ovs[0]["action"], "skip")
+        self.assertEqual(ovs[0]["local_date"], "2026-11-10")
+
+    def test_override_query_carries_window_and_soft_delete(self):
+        seen = {r["table"]: r["query"] for r in _FakePostgrest.received}
+        self.assertIn("daily_item_overrides", seen)
+        q = seen["daily_item_overrides"]
+        self.assertIn("gte.", q)
+        self.assertIn("lte.", q)
+        self.assertIn("deleted_at", q)
+
 
     def test_payload_has_no_internal_columns(self):
         """白名单在真实往返里也不能漏。"""

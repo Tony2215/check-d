@@ -89,6 +89,12 @@ COURSE_RULE_COLUMNS = ("id", "course_id", "weekday", "week_rule_type",
                        "start_week", "end_week", "interval_weeks",
                        "week_numbers", "starts_at_minute", "ends_at_minute")
 
+# 单日例外（临时停课、调课、挪到别的时间）。
+# 只取排期需要的列：`temporary_classroom` 与 `reminder_minute_of_day` 对排期无用，
+# 属个人信息，不取；`notes` 是用户随手写的，更不取。
+OVERRIDE_COLUMNS = ("id", "item_type", "item_id", "local_date", "action",
+                    "planned_start_minute", "planned_end_minute")
+
 
 # --------------------------------------------------------------------------
 # 枚举转换
@@ -109,6 +115,16 @@ WEEK_RULE_BY_DB = {
     "evenWeeks": "even_weeks",
     "everyNWeeks": "every_n_weeks",
     "custom": "custom",
+}
+
+# 单日例外的 `item_type`：库里是 `oneTime`，MOCK 风格是 `one_time`。
+# 同一个坑在 `week_rule_type` 上也有一份 —— 真实 schema 用 camelCase，
+# 工具层用 snake_case。**统一在这里转，下游不要转第二次。**
+# 两处都不做「未知值兜底」：静默放过一个没见过的枚举，等于把错误往后推一层。
+ITEM_TYPE_BY_DB = {
+    "oneTime": "one_time",
+    "recurring": "recurring",
+    "course": "course",
 }
 
 
@@ -396,29 +412,61 @@ class RealRead:
     def get_calendar_events(self, start, end, external_fixed_events=None):
         as_of = datetime.now(timezone.utc).isoformat()
 
+        # 单日例外先读，且**不因为「没有课程」就跳过**：
+        # 一个没录课程的用户照样可能给某个任务设了「今天不做」。
+        # 早先的顺序是先查 courses、空了就直接 return，会把这类例外整片丢掉。
+        overrides = self._read_overrides(start, end)
+
         course_rows = self.reader.select(
             "courses", COURSE_COLUMNS,
             filters=["deleted_at=is.null"], order="updated_at.desc")
-        if not course_rows:
-            return self._events_payload([], [], start, end, as_of)
-
-        ids = [r["id"] for r in course_rows]
-        rules = _group_by(self.reader.select(
-            "course_schedule_rules", COURSE_RULE_COLUMNS,
-            filters=["course_id=in.(%s)" % ",".join(ids), "deleted_at=is.null"]),
-            "course_id")
 
         courses = []
-        for row in course_rows:
-            courses.append({
-                "course_id": row["id"],
-                "name": row.get("name"),
-                "status": row.get("status"),
-                "semester": row.get("semester"),
-                "updated_at": _iso(row.get("updated_at")),
-                "rules": [self._shape_rule(r) for r in rules.get(row["id"], [])],
+        if course_rows:
+            ids = [r["id"] for r in course_rows]
+            rules = _group_by(self.reader.select(
+                "course_schedule_rules", COURSE_RULE_COLUMNS,
+                filters=["course_id=in.(%s)" % ",".join(ids),
+                         "deleted_at=is.null"]), "course_id")
+            for row in course_rows:
+                courses.append({
+                    "course_id": row["id"],
+                    "name": row.get("name"),
+                    "status": row.get("status"),
+                    "semester": row.get("semester"),
+                    "updated_at": _iso(row.get("updated_at")),
+                    "rules": [self._shape_rule(r) for r in rules.get(row["id"], [])],
+                })
+        return self._events_payload(courses, [], overrides, start, end, as_of)
+
+    def _read_overrides(self, start, end):
+        """读单日例外。**按查询窗口过滤**，不把整张历史拉下来。
+
+        `daily_item_overrides` 会随时间无限增长（每天每项最多一条），
+        不带日期条件地全量读，演示用的小账号没问题，真用起来就是性能陷阱。
+        """
+        rows = self.reader.select(
+            "daily_item_overrides", OVERRIDE_COLUMNS,
+            filters=["deleted_at=is.null",
+                     "local_date=gte." + start,
+                     "local_date=lte." + end])
+        out = []
+        for r in rows:
+            item_type = ITEM_TYPE_BY_DB.get(r.get("item_type"))
+            if item_type is None:
+                raise RealReadError(
+                    "INTERNAL_ERROR", "单日例外出现未知 item_type，拒绝猜测。",
+                    [{"field": "item_type", "reason": r.get("item_type")}])
+            out.append({
+                "override_id": r["id"],
+                "item_type": item_type,
+                "item_id": r.get("item_id"),
+                "local_date": _date(r.get("local_date")),
+                "action": r.get("action"),
+                "planned_start_minute": r.get("planned_start_minute"),
+                "planned_end_minute": r.get("planned_end_minute"),
             })
-        return self._events_payload(courses, [], start, end, as_of)
+        return out
 
     def _shape_rule(self, r):
         return {
@@ -433,7 +481,7 @@ class RealRead:
             "end_minute": r.get("ends_at_minute"),
         }
 
-    def _events_payload(self, courses, events, start, end, as_of):
+    def _events_payload(self, courses, events, overrides, start, end, as_of):
         return {
             "source": "real",
             "as_of": as_of,
@@ -444,5 +492,5 @@ class RealRead:
             # 展开由 M2 的模块提供，调用方组合后填入。
             "events": events,
             "events_unavailable_reason": "week_expansion_not_implemented_here",
-            "daily_overrides": [],
+            "daily_overrides": overrides,
         }
