@@ -227,6 +227,27 @@ class TestReverseIsolation(unittest.TestCase):
         self.assertEqual(code, 401, "X-Real-Token 开得了 MOCK，两条路径就没分开")
         self.assertEqual(_err((code, body)), "APPROVAL_UNTRUSTED")
 
+    def test_both_tokens_mock_path_still_uses_demo_only(self):
+        """两个口令同时带时，MOCK 路径仍然只认 `X-Demo-Token`。
+
+        这是「反向隔离」最容易漏的一种情形：单独带错头会被拒，
+        但「带了正确口令的同时夹带另一个」，如果鉴权是「任一头对就放行」，隔离就形同虚设。
+        """
+        code, body = self.s.mock(demo_token="wrong-demo", real_token=self.REAL)
+        self.assertEqual(code, 401, "MOCK 认了 X-Real-Token = 隔离失效")
+        self.assertEqual(_err((code, body)), "APPROVAL_UNTRUSTED")
+
+    def test_both_tokens_real_path_still_uses_real_only(self):
+        """反向：REAL 路径只认 `X-Real-Token`，夹带 `X-Demo-Token` 不影响判定。
+
+        断言「不是 401/403」而不是某个具体状态码：鉴权通过之后会走到数据源配置检查，
+        那一步的结果取决于本用例的 env，与本条要钉的东西无关。
+        """
+        code, body = self.s.real(real_token=self.REAL, demo_token=self.DEMO)
+        self.assertNotIn(code, (401, 403),
+                         "两个头都带时 REAL 拒了正确口令，说明鉴权看错了头")
+        self.assertNotEqual(_err((code, body)), "AUTH_REQUIRED")
+
     def test_wrong_real_token_is_403_not_401(self):
         code, body = self.s.real(real_token="guess")
         self.assertEqual(code, 403)

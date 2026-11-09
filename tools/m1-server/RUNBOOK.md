@@ -380,11 +380,13 @@ python -m unittest discover -s tools/m1-server/tests
 
 | 文件 | 项数 | 钉住什么 |
 |---|---|---|
-| `test_real_read.py` | 28 | 字段映射、白名单、错误码、空集不回落、不传 user_id |
-| `test_real_path_http.py` | 21 | 反向隔离、工具面、失败不回落、窗口、现网回归 |
-| `test_real_end_to_end.py` | 8 | 假 PostgREST 端到端：JWT 透传、信封形状、`data.tasks`、软删除过滤的适用范围 |
+| `test_real_read.py` | 33 | 字段映射、白名单、错误码、空集不回落、不传 user_id |
+| `test_real_path_http.py` | 23 | 反向隔离（含「两个口令同时带」）、工具面、失败不回落、窗口、现网回归 |
+| `test_real_end_to_end.py` | 10 | 假 PostgREST 端到端：JWT 透传、信封形状、`data.tasks`、软删除过滤的适用范围 |
 | `test_real_token_update.py` | 9 | 令牌注入入口：鉴权、形状校验、不回显 |
 | `test_real_schema_columns.py` | 5 | **静态核对**：用到的每一列都真在 migration 里存在（不连网） |
+
+合计 **80 项**（REAL 五份）。整套（含 MOCK 与快照库）**277 项**。
 
 ### 列名必须对 migration 做静态核验（2026-11-09 实测踩到）
 
