@@ -382,5 +382,31 @@ python -m unittest discover -s tools/m1-server/tests
 |---|---|---|
 | `test_real_read.py` | 28 | 字段映射、白名单、错误码、空集不回落、不传 user_id |
 | `test_real_path_http.py` | 21 | 反向隔离、工具面、失败不回落、窗口、现网回归 |
-| `test_real_end_to_end.py` | 8 | 假 PostgREST 端到端：JWT 透传、信封形状、`data.tasks` |
+| `test_real_end_to_end.py` | 8 | 假 PostgREST 端到端：JWT 透传、信封形状、`data.tasks`、软删除过滤的适用范围 |
 | `test_real_token_update.py` | 9 | 令牌注入入口：鉴权、形状校验、不回显 |
+| `test_real_schema_columns.py` | 5 | **静态核对**：用到的每一列都真在 migration 里存在（不连网） |
+
+### 列名必须对 migration 做静态核验（2026-11-09 实测踩到）
+
+假 PostgREST **不校验列名**。所以列写错时，全部测试照旧绿，一到真实库就是
+400 `column ... does not exist`，而外部看到的是「整个 `list_tasks` 失败」——
+极容易被误诊成令牌或权限问题。
+
+真实案例：`task_schedules` 建表（`202609020001`）时没有 `deleted_at`，
+后续 `202609100001` 只加了 `weekdays_mask`，这张表的删除靠外键 `on delete cascade` 硬删。
+而查询里带了 `deleted_at=is.null` → 真实库必 400。
+
+规矩：
+
+1. 改 `real_read.py` 的列白名单或 `filters`，**同时**改
+   `tests/test_real_schema_columns.py` 的 `QUERIED` 映射，然后跑一次。它会解析
+   `supabase/migrations/*.sql` 建表语句与 `add column`，逐列断言存在性。
+2. 加软删除过滤前先确认那张表**真有** `deleted_at`。实测（静态解析 9 份 migration）：
+   **有** 17 张（`tasks` / `tags` / `task_completions` / `plans` / `reviews` / `courses` /
+   `course_schedule_rules` / `daily_item_overrides` / `timer_sessions` / `notifications` /
+   `reminder_rules` / `alarm_rules` / `ad_hoc_timers` / `semesters` /
+   `schedule_templates` / `schedule_template_segments` / `user_preferences`）；
+   **没有** 11 张（含 `task_schedules`、`one_time_reminders`、`long_term_tasks`、
+   `plan_tasks`、`devices`、`holidays`、`profiles` 等）。
+3. 这条核验是**静态**的，只能证明列名对得上 migration；证明不了线上库的
+   migration 已跑到哪一版。后者要靠 M0 在真库上跑一次。

@@ -340,9 +340,13 @@ class RealRead:
         long_terms = _group_by(self.reader.select(
             "long_term_tasks", TASK_LONG_TERM_COLUMNS,
             filters=[in_filter]), "task_id")
+        # `task_schedules` **没有** `deleted_at` 列（migration 202609020001 建表时就没有，
+        # 后续 202609100001 只加了 weekdays_mask）。这张表的删除靠外键 `on delete cascade` 硬删。
+        # 带 `deleted_at=is.null` 会被 PostgREST 判 400（column does not exist），
+        # 表现是整个 list_tasks 失败，而假 PostgREST 不校验列名，所以单测发现不了。
         schedules = _group_by(self.reader.select(
             "task_schedules", TASK_SCHEDULE_COLUMNS,
-            filters=[in_filter, "deleted_at=is.null"]), "task_id")
+            filters=[in_filter]), "task_id")
 
         notes = []
         tasks = []

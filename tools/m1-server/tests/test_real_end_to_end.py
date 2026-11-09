@@ -278,13 +278,25 @@ class TestEndToEndRead(unittest.TestCase):
             self.assertNotIn("user_id", req["query"],
                              "%s 的查询带了 user_id 条件，隔离就落到调用方身上了" % req["table"])
 
-    def test_deleted_filter_always_sent(self):
+    def test_deleted_filter_only_on_tables_that_have_the_column(self):
+        """软删除过滤只许加在**真有** `deleted_at` 列的表上。
+
+        `task_schedules` 建表时（migration 202609020001）就没有 `deleted_at`，
+        后续 202609100001 只加了 weekdays_mask；这张表的删除靠外键 `on delete cascade` 硬删。
+        带 `deleted_at=is.null` 会被 PostgREST 判 400（column does not exist），
+        表现是整个 list_tasks 失败。假 PostgREST 不校验列名，所以只有这条断言能守住。
+        """
         self.stack.call("list_tasks")
-        tables_with_soft_delete = {"tasks", "task_schedules"}
+        self.stack.call("get_calendar_events")
+        tables_with_soft_delete = {"tasks", "courses", "course_schedule_rules",
+                                   "daily_item_overrides"}
         seen = {r["table"]: r["query"] for r in _FakePostgrest.received}
-        for t in tables_with_soft_delete:
-            if t in seen:
-                self.assertIn("deleted_at", seen[t], "%s 没带软删除过滤" % t)
+        for t, q in seen.items():
+            if t in tables_with_soft_delete:
+                self.assertIn("deleted_at", q, "%s 没带软删除过滤" % t)
+            else:
+                self.assertNotIn("deleted_at", q,
+                                 "%s 没有 deleted_at 列，不能带这个过滤" % t)
 
     def test_calendar_events_maps_week_rule_but_does_not_expand(self):
         code, body = self.stack.call("get_calendar_events")
