@@ -23,6 +23,7 @@
    不写任何数据库。
 """
 
+import base64
 import importlib
 import json
 import os
@@ -45,6 +46,16 @@ if HERE not in sys.path:
 import errors as errs  # noqa: E402  PR-A 的 21 码 HTTP 映射
 
 import tool_server as mock  # noqa: E402  唯一的工具实现
+
+# REAL 适配层是隔离开发件。导入失败**不能影响现网**：MOCK 那七条工具与它毫无关系，
+# 只因一个可选模块缺依赖就整站起不来，是不可接受的。所以这里吞掉导入异常，
+# 等真正走到 /real/* 时再报 DEPENDENCY_UNAVAILABLE，并带上失败原因。
+try:
+    import real_read  # noqa: E402
+    _REAL_IMPORT_ERROR = None
+except Exception as _exc:                       # pragma: no cover - 正常环境不会触发
+    real_read = None
+    _REAL_IMPORT_ERROR = _exc
 
 SERVICE_NAME = "checkd-agent-tools"
 SERVICE_VERSION = "1.0.0"
@@ -150,6 +161,89 @@ SNAPSHOT_TOOLS = frozenset({
 })
 
 _store = {"instance": None, "error": None}
+
+
+# --------------------------------------------------------------- REAL-READ
+#
+# 隔离开发件（M0 2026-11-09T14:08 派工）。**默认全关**，线上现网 `/mcp` 与 `/tools/*`
+# 行为零变化；REAL 走独立路径 `/real/mcp`、`/real/tools/*`。
+#
+# 为什么开新路径而不是在旧路径上分流：M0 明确要求「不改已部署公网 MOCK」。
+# 同一路径内按请求头分流，任何一处判空写错都会让现网跟着变；两条路径物理隔开，
+# 出问题只影响新路径，回滚就是把 CHECKD_REAL_ENABLED 设回 0。
+REAL_ENABLED = os.environ.get("CHECKD_REAL_ENABLED", "0") == "1"
+
+# REAL 路径的独立口令。**故意不复用 CHECKD_DEMO_TOKEN**：
+# 那个口令 2026-11-08 已经写进邮件、进过交付件、在多人手里。
+# 若它也能开 REAL，等于「隔离」只存在于命名上。反向隔离是这套设计的地基。
+REAL_TOKEN = os.environ.get("CHECKD_REAL_TOKEN", "")
+
+REAL_SUPABASE_URL = os.environ.get("CHECKD_REAL_SUPABASE_URL", "")
+REAL_ANON_KEY = os.environ.get("CHECKD_REAL_ANON_KEY", "")
+# 用户级短期 access_token（约 1 小时过期）。只从环境变量读，不落盘、不回显。
+# M0 2026-11-09T14:20 决定：不做自动续期，由 M0 演示前手动更新。
+REAL_JWT = os.environ.get("CHECKD_REAL_JWT", "")
+
+# 运行时可注入的 access_token（M0 手动更新用，**不是自动续期**）。
+# 为什么需要：环境变量只在进程启动时读一次，演示前换令牌就得重新部署——
+# 而 2026-11-07 那次重新部署把全站弄成 503 过。有了这个入口，
+# 更新令牌是「一次带管理口令的 POST」，不触碰部署、地址与 sharecode 都不变。
+# 只驻内存：进程重启即失效（回到环境变量里的值），不落盘、不写任何文件。
+_REAL_JWT_OVERRIDE = {"value": None, "set_at": None}
+
+
+def _current_real_jwt():
+    """运行时注入优先，其次环境变量。"""
+    return _REAL_JWT_OVERRIDE["value"] or REAL_JWT
+
+
+def _looks_like_jwt(tok):
+    """粗判形状：三段、中间段能解出 `exp`。
+
+    **这不是验签**，本服务没有 JWT secret 也不该有（那等于能伪造任意用户，
+    比 service_role 更危险）。这里只拦「明显不是 JWT 的东西」，
+    真实校验由 Supabase 端做：令牌无效时它会 401，走到 AUTH_REQUIRED。
+    """
+    if not isinstance(tok, str):
+        return False, "令牌必须是字符串"
+    parts = tok.split(".")
+    if len(parts) != 3:
+        return False, "不是三段式 JWT"
+    try:
+        pad = "=" * (-len(parts[1]) % 4)
+        claims = json.loads(base64.urlsafe_b64decode(parts[1] + pad).decode("utf-8"))
+    except Exception:
+        return False, "载荷段无法解析"
+    if not isinstance(claims, dict) or "exp" not in claims:
+        return False, "载荷里没有 exp"
+    return True, claims
+
+
+# 演示窗口（形如 "14:00-16:00"，按服务器本地时间）。留空 = 不限制。
+# M0 说方案②只是候选策略、时段须他单独确认，所以这里只提供能力，不预设开启。
+REAL_WINDOW = os.environ.get("CHECKD_REAL_WINDOW", "").strip()
+
+# REAL 侧只挂两个只读工具。其余五个**不出现在 tools/list 里**，
+# 而不是出现后返回错误——Agent 看不到就无从误调，比让它先试一次再报错干净。
+REAL_TOOL_NAMES = ("list_tasks", "get_calendar_events")
+
+
+def _in_real_window(now=None):
+    """演示窗口判定。未配置即恒真。配置非法时**拒绝**而不是放行。"""
+    if not REAL_WINDOW:
+        return True, None
+    now = now or datetime.now()
+    try:
+        a, b = REAL_WINDOW.split("-")
+        ha, ma = [int(x) for x in a.split(":")]
+        hb, mb = [int(x) for x in b.split(":")]
+    except Exception:
+        return False, "CHECKD_REAL_WINDOW 格式非法（应为 HH:MM-HH:MM）"
+    cur = now.hour * 60 + now.minute
+    if ha * 60 + ma <= cur <= hb * 60 + mb:
+        return True, None
+    return False, "当前不在 REAL 演示窗口内（%s）" % REAL_WINDOW
+
 
 
 def _snapshot_store():
@@ -671,7 +765,112 @@ def _mcp_error(rid, code, message):
     return {"jsonrpc": "2.0", "id": rid, "error": {"code": code, "message": message}}
 
 
-def _mcp_handle(msg):
+def _real_call(name, args):
+    """REAL 只读工具的唯一执行入口。返回 (http_status, body)。
+
+    **与 `_call` 分开写，不是重复代码。** 两者的失败语义相反：
+    `_call` 走 MOCK，出错只是这次调用失败；REAL 侧任何失败都**不许**退回 MOCK 顶上，
+    否则验收方拿到的是一份「看起来成功」的假数据，而这正是 M0 反复强调要避免的
+    （2026-11-09T14:08 第 3 条「不允许 engine:real 静默回落 MOCK」）。
+
+    合在一个函数里迟早会有人图省事写 `except: return _call(name, args)`。
+    """
+    started = time.time()
+    trace = uuid.uuid4().hex[:16]
+    ok = False
+    code = None
+    request_id = args.get("request_id") if isinstance(args, dict) else None
+
+    # 参数校验复用与 MOCK 完全相同的一份，避免两条路径对同一个错参数给出不同结论。
+    bad = _validate_input(name, args)
+    if bad is not None:
+        vcode, vmsg, vdetails = bad
+        body = errs.to_envelope(vcode, vmsg, request_id=request_id,
+                                trace_id=trace, details=vdetails)
+        body["source"] = "real"
+        entry = {"ts": _now(), "trace_id": trace, "tool": name, "arguments": args,
+                 "ok": False, "error_code": vcode, "duration_ms": 0,
+                 "gate": "input_schema", "source": "real"}
+        with _LOCK:
+            _STATS["calls"] += 1
+            _STATS["errors"] += 1
+            _EVIDENCE.append(entry)
+        return errs.http_status(vcode), body
+
+    try:
+        if real_read is None:
+            raise RuntimeError("REAL 适配层未加载：%s" % (_REAL_IMPORT_ERROR,))
+        # 信封与日期范围仍用 mock 的解析器：同一份契约只实现一次。
+        inp = mock.validate_envelope(args)
+        start, end = mock.date_range(inp)
+
+        reader = real_read.SupabaseReader(REAL_SUPABASE_URL, REAL_ANON_KEY,
+                                          _current_real_jwt())
+        impl = real_read.RealRead(reader)
+        if name == "list_tasks":
+            payload = impl.list_tasks(start.isoformat(), end.isoformat(),
+                                      kinds=inp.get("kinds"),
+                                      statuses=inp.get("statuses"))
+        else:
+            payload = impl.get_calendar_events(start.isoformat(), end.isoformat())
+
+        # **信封必须与 MOCK 走同一个 `mock.envelope`。**
+        # 否则 Agent 侧要为同一件事写两套解析（`data.tasks` vs 顶层 `tasks`），
+        # 而且切换数据源时最容易出的 bug 就是「字段读不到但没报错，只是空」。
+        # 结构一致是这个模块能被「换源不换代码」的前提。
+        body = mock.envelope(request_id, "success", {"data": payload})
+        body["trace_id"] = "trace_" + trace
+        # M0 2026-11-09T10:51 要求区分 REAL-READ / MOCK-SCHEDULE / REAL-WRITE。
+        # 信封层强制写 real，不依赖下层是否老实标注。
+        body["source"] = "real"
+        body["data_source"] = "supabase"
+        status = 200
+        ok = True
+    except Exception as exc:
+        code = getattr(exc, "code", None)
+        if not (code and errs.is_known_code(code)):
+            # 未知异常不吞：打栈到 stderr，对外只给 INTERNAL_ERROR。
+            # 这里如果把 exc 文案直接回给调用方，数据库连接串/库名可能一起漏出去。
+            sys.stderr.write("REAL tool %s failed:\n%s" % (name, traceback.format_exc()))
+            code = "INTERNAL_ERROR"
+        msg = getattr(exc, "message", None) or "REAL 读取失败。"
+        details = getattr(exc, "details", None) or []
+        body = errs.to_envelope(code, msg, request_id=request_id,
+                                trace_id=trace, details=details)
+        # 错误也标 real：验收方才能判断「这条失败来自真实数据层」，
+        # 而不是去查 MOCK 服务是不是挂了。
+        body["source"] = "real"
+        status = errs.http_status(code)
+
+    entry = {"ts": _now(), "trace_id": trace, "tool": name, "arguments": args,
+             "ok": ok, "error_code": code,
+             "duration_ms": int((time.time() - started) * 1000), "source": "real"}
+    with _LOCK:
+        _STATS["calls"] += 1
+        if not ok:
+            _STATS["errors"] += 1
+        _EVIDENCE.append(entry)
+        if len(_EVIDENCE) > _EVIDENCE_CAP:
+            del _EVIDENCE[:len(_EVIDENCE) - _EVIDENCE_CAP]
+    return status, body
+
+
+def _real_tool_defs():
+    """REAL 侧对外的工具清单：只有两个只读工具。
+
+    其余五个不出现，而不是出现后报错 —— Agent 看不到就无从误调。
+    描述前缀 `[REAL]` 让模型能区分同名工具的两个版本（MOCK / 真实数据）。
+    """
+    out = []
+    for spec in mock.tool_defs():
+        if spec.get("name") in REAL_TOOL_NAMES:
+            spec = dict(spec)
+            spec["description"] = "[REAL] " + (spec.get("description") or "")
+            out.append(spec)
+    return out
+
+
+def _mcp_handle(msg, real=False):
     """处理一条 JSON-RPC 报文。
 
     无状态实现：不发放 session id，每次请求自带全部语义。这样反向代理后面
@@ -684,10 +883,15 @@ def _mcp_handle(msg):
     params = msg.get("params") or {}
 
     if method == "initialize":
+        # REAL 路径用不同的 serverInfo 名字：MCP 客户端会把 serverInfo 显示给用户，
+        # 看到 "checkd-agent-tools" 和看到 "checkd-agent-tools-real" 是两件事，
+        # 演示时能一眼确认当前连的是哪个数据源，不必去猜。
+        info = {"name": SERVICE_NAME + ("-real" if real else ""),
+                "version": SERVICE_VERSION}
         return _mcp_result(rid, {
             "protocolVersion": params.get("protocolVersion") or MCP_PROTOCOL,
             "capabilities": {"tools": {"listChanged": False}},
-            "serverInfo": {"name": SERVICE_NAME, "version": SERVICE_VERSION},
+            "serverInfo": info,
         })
 
     if method in ("notifications/initialized", "notifications/cancelled"):
@@ -697,11 +901,23 @@ def _mcp_handle(msg):
         return _mcp_result(rid, {})
 
     if method == "tools/list":
-        return _mcp_result(rid, {"tools": mock.tool_defs()})
+        return _mcp_result(rid, {"tools": _real_tool_defs() if real else mock.tool_defs()})
 
     if method == "tools/call":
         name = params.get("name")
         args = params.get("arguments") or {}
+        if real:
+            if name not in REAL_TOOL_NAMES:
+                # 明确说清是「REAL 侧不提供」，不是「工具不存在」——
+                # 后者会让排查方向跑到注册表上。
+                return _mcp_error(rid, -32602,
+                                  "tool not available on REAL path: %s" % name)
+            status, body = _real_call(name, args)
+            return _mcp_result(rid, {
+                "content": [{"type": "text", "text": json.dumps(body, ensure_ascii=False)}],
+                "structuredContent": body,
+                "isError": status >= 400,
+            })
         if name not in mock.TOOLS:
             return _mcp_error(rid, -32602, "unknown tool: %s" % name)
         # 只调用一次：_call 里已经执行并记了证据，这里只把结果包成 MCP 形状。
@@ -844,6 +1060,45 @@ class Handler(BaseHTTPRequestHandler):
             return False
         return True
 
+    def _real_ok(self):
+        """REAL 路径的鉴权。**只认 `X-Real-Token` 一个头。**
+
+        三条与 `_auth_ok` 故意不同，每条都有原因：
+
+        1. **不收 `Authorization`**。`_auth_ok` 收它是因为平台反代会注入、
+           而 MOCK 的用户可能只配了那一个头。REAL 侧反过来：反代注入的内容
+           来源不可控，把它当凭证等于让网关替我们做鉴权决定。
+        2. **不收 `X-Demo-Token`**。那个口令 2026-11-08 已写进邮件、进过交付件、
+           在多人手里。若它能开 REAL，「两套凭证隔离」就只剩命名上的区别。
+        3. **未配置即拒绝（fail-closed）**，不回落到 MOCK。
+           这条最容易被人「优化」成 `return True`，那样 REAL 路径会变成
+           无鉴权的真实数据出口 —— 正是 M0 2026-11-09T10:51 明令禁止的。
+        """
+        if not REAL_ENABLED:
+            self._fail(503, "DEPENDENCY_UNAVAILABLE",
+                       "REAL-READ 未启用（CHECKD_REAL_ENABLED 未设为 1）。")
+            return False
+        if not REAL_TOKEN:
+            self._fail(503, "DEPENDENCY_UNAVAILABLE",
+                       "REAL-READ 未配置访问口令，已按失败即关闭处理。")
+            return False
+        in_window, why = _in_real_window()
+        if not in_window:
+            self._fail(403, "FORBIDDEN", why or "不在演示窗口内。")
+            return False
+
+        got = self.headers.get("X-Real-Token")
+        if not got:
+            self._fail(401, "AUTH_REQUIRED",
+                       "缺少 REAL 访问凭证：请在 X-Real-Token 请求头提供。",
+                       details=[{"field": "X-Real-Token", "reason": "missing"}])
+            return False
+        if not hmac.compare_digest(got.strip(), REAL_TOKEN):
+            self._fail(403, "FORBIDDEN", "REAL 访问凭证无效。",
+                       details=[{"field": "X-Real-Token", "reason": "invalid"}])
+            return False
+        return True
+
     def _admin_ok(self):
         if not ADMIN_KEY:
             self._fail(404, "NOT_FOUND", "该端点未启用。")
@@ -897,6 +1152,13 @@ class Handler(BaseHTTPRequestHandler):
                 # /health 被高频探活，不能因为它去 ping 数据库。
                 "snapshot_mode": SNAPSHOT_MODE,
                 "snapshot_dsn_configured": bool(DEMO_DSN),
+                # REAL-READ 接线状态（隔离开发件）。只报**事实**，不报令牌内容：
+                # 演示前 M0 最需要知道的是「令牌还有多久过期」，
+                # 因为过期的表现是 401，容易被当成配置写错而白折腾半小时。
+                "real_enabled": REAL_ENABLED,
+                "real_token_source": _real_token_source(),
+                "real_token_expires_at": _real_token_exp(),
+                "real_data_source_configured": bool(REAL_SUPABASE_URL and REAL_ANON_KEY),
             })
             return
 
@@ -954,6 +1216,105 @@ class Handler(BaseHTTPRequestHandler):
                 _STATS["calls"] = 0
                 _STATS["errors"] = 0
             self._send(200, {"ok": True, "reset": True, "counts": counts})
+            return
+
+        if path == "/admin/real-token":
+            # M0 手动更新 REAL 短期授权的唯一入口。**不是自动续期**：
+            # 没有定时器、没有 refresh_token、没有任何后台动作，
+            # 只有人拿管理口令 POST 一次才变。
+            #
+            # 为什么要有它：环境变量只在进程启动时读一次，换令牌就得重新部署；
+            # 而 2026-11-07 那次重新部署把全站弄成 503 过。有了这个入口，
+            # 演示前更新令牌不必碰部署，地址与 sharecode 都不变。
+            if not self._admin_ok():
+                return
+            try:
+                payload = self._json_body()
+            except _BodyTooLarge as exc:
+                self._body_too_large(exc)
+                return
+            except Exception:
+                self._fail(400, "INVALID_ARGUMENT", "请求体不是合法 JSON。")
+                return
+            tok = (payload or {}).get("access_token")
+            ok_shape, detail = _looks_like_jwt(tok)
+            if not ok_shape:
+                # 报错里**不回显令牌内容**，只说要什么形状。
+                self._fail(400, "INVALID_ARGUMENT",
+                           "access_token 不像 JWT：%s。" % detail)
+                return
+            exp = detail.get("exp")
+            now = int(time.time())
+            if isinstance(exp, (int, float)) and exp < now:
+                # 收下一个已过期的令牌没有意义，只会让后续 401 看起来像配置错。
+                self._fail(400, "INVALID_ARGUMENT",
+                           "该 access_token 已经过期，请在 M0 本机重新获取。")
+                return
+            _REAL_JWT_OVERRIDE["value"] = tok
+            _REAL_JWT_OVERRIDE["set_at"] = _now()
+            # 响应只说「收了、何时过期」，不返回值本身、不回显指纹。
+            self._send(200, {
+                "ok": True,
+                "real_token_updated": True,
+                "expires_at": (datetime.fromtimestamp(exp, timezone.utc).isoformat()
+                               if isinstance(exp, (int, float)) else None),
+                "expires_in_seconds": (int(exp - now)
+                                       if isinstance(exp, (int, float)) else None),
+                "note": "只驻内存，进程重启后回到环境变量里的值。",
+            })
+            return
+
+        if path == "/real/mcp":
+            # REAL 是**独立路径**，不与 /mcp 共用。M0 2026-11-09T14:08 要求
+            # 「不改已部署公网 MOCK」，同路径内按头分流任何一处判断写错都会波及现网。
+            if not self._real_ok():
+                return
+            try:
+                payload = self._json_body()
+            except _BodyTooLarge as exc:
+                self._body_too_large(exc)
+                return
+            except Exception:
+                self._send(400, _mcp_error(None, -32700, "parse error"))
+                return
+            if isinstance(payload, list):
+                out = [r for r in (_mcp_handle(m, real=True) for m in payload)
+                       if r is not None]
+                self._send(200, out)
+                return
+            resp = _mcp_handle(payload, real=True)
+            if resp is None:
+                self.send_response(202)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            self._send(200, resp)
+            return
+
+        if path.startswith("/real/tools/"):
+            if not self._real_ok():
+                return
+            name = path[len("/real/tools/"):]
+            if name not in REAL_TOOL_NAMES:
+                # 404 + 明确文案：这是「本路径不提供」，不是「工具没实现」。
+                # 两者混淆会让排查跑到工具注册表上，而真实原因只是走了别的路径。
+                self._fail(404, "NOT_FOUND",
+                           "REAL 路径不提供该工具：%s（仅 %s）"
+                           % (name, "/".join(REAL_TOOL_NAMES)))
+                return
+            try:
+                args = self._json_body()
+            except _BodyTooLarge as exc:
+                self._body_too_large(exc)
+                return
+            except Exception:
+                self._fail(400, "INVALID_ARGUMENT", "请求体不是合法 JSON。")
+                return
+            if not isinstance(args, dict):
+                self._fail(400, "INVALID_ARGUMENT", "请求体必须是对象。")
+                return
+            status, body = _real_call(name, args)
+            self._send(status, body)
             return
 
         if path == "/mcp":
@@ -1029,6 +1390,36 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_DELETE(self):
         self._fail(405, "INVALID_ARGUMENT", "不支持的方法。")
+
+
+def _real_token_source():
+    """令牌从哪来。三值而非 bool：排障时要区分「没配」和「配了但被运行时覆盖」。"""
+    if _REAL_JWT_OVERRIDE["value"]:
+        return "runtime"
+    if REAL_JWT:
+        return "env"
+    return "none"
+
+
+def _real_token_exp():
+    """从 JWT 载荷里取 exp 转 ISO。**不验签**，只用于诊断。
+
+    解析失败一律返回 None，不抛异常 —— `/health` 是探活端点，
+    不能因为一个畸形令牌就整个 500。
+    """
+    tok = _current_real_jwt()
+    if not tok:
+        return None
+    ok, detail = _looks_like_jwt(tok)
+    if not ok or not isinstance(detail, dict):
+        return None
+    exp = detail.get("exp")
+    if not isinstance(exp, (int, float)):
+        return None
+    try:
+        return datetime.fromtimestamp(exp, timezone.utc).isoformat()
+    except Exception:
+        return None
 
 
 def _scheduler_mode():

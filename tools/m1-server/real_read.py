@@ -1,0 +1,448 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""REAL-READ 适配层：读 M0 账号**已同步到 Supabase 的**真实任务与课程。
+
+这是隔离开发件，不是已上线能力。读它之前先看这五条边界，每一条都有具体原因：
+
+## 1. 不接受调用方传 `user_id`
+
+用户隔离由 Postgres 的行级安全策略（RLS）里 `auth.uid() = user_id` 决定，不由本模块决定。
+一旦允许调用方指定 user_id，隔离就变成「调用方自觉」，而 M0 2026-11-09T10:51 的硬要求是
+「必须在服务端实施访问控制，不得仅靠调用方或提示词」。所以 `user_id` 不在任何入参里，
+查询也不带 `user_id=eq.` 条件 —— 让 RLS 独自决定能看见哪些行。
+
+**代价（必须知情）**：如果部署时用错了密钥（比如换了 service_role），RLS 会被绕过，
+本模块**自身察觉不到**。防线在密钥选择上，不在代码里。这条已写进 M0 操作清单。
+
+## 2. 显式列白名单，不用 `select=*`
+
+返回的列是逐字段列出的常量（`TASK_COLUMNS` / `COURSE_COLUMNS`）。
+理由有两条：
+- `*` 会把 `notes`、`teacher`、`classroom`、`color`、`user_id` 一并带出来，
+  这些字段对排期没用，却都是个人隐私或内部标识；
+- 列一变多，前端和验收方都察觉不到，问题只能在事后发现。
+
+M0 2026-11-09T14:08 原文要求「最小字段白名单」，这是它的实现。
+
+## 3. `deleted_at is null` 恒带
+
+真实表都是软删除。漏这个条件会把用户已经删掉的任务读回来，
+演示时表现为「我明明删了，Agent 还给我排」——比功能缺失更难看。
+
+## 4. 空集不回落 MOCK（红线）
+
+查到 0 条就是 0 条，返回空数组 + `source="real"`。
+**绝不**「因为没数据就换一批假数据顶上」。那样验收方看到的是假通过，
+而且是最难发现的一类假：数据看起来完全正常。
+
+## 5. `source` / `as_of` / `data_window` 恒带
+
+M0 2026-11-09T10:51 要求「本阶段必须清晰区分 REAL-READ / MOCK-SCHEDULE / REAL-WRITE」。
+`source="real"` 让验收方不必靠域名去猜。
+`as_of` 是**本进程读到数据的那一刻**，不是数据本身的修改时间；
+`data_window` 是本次查询的时间窗。两者都不是装饰，缺了就无法判断证据是否过期。
+
+## 本模块不做什么
+
+- **不做课程周次展开**（把 `week_rule_type` + `start_week` 展开成具体日期）。
+  那是 M2 的模块（M0 2026-11-09T14:08 派工原文：M2「独立负责」课程周次展开）。
+  本模块只把规则**原样取出并规范化**，`events` 恒为空数组并带
+  `events_unavailable_reason`，展开由调用方组合。
+- **不做 Task/Course → Agent 结构 的语义转换。** 同样归 M2。
+  本模块输出的是「已做字段白名单与枚举规范化、但仍贴近真实 schema」的结构：
+  例如 `deadline` 是 `{"kind":"exact"|"date_only"|"none"}` 的显式形状，
+  而 MOCK 用的是同一形状 —— 这一层是对齐的，所以接入方不用为截止时间写两套判断。
+  差异之处（如 `duration_target_seconds` 真实可能为 null）**如实保留，不补齐**。
+- 不做排程、不做写入、不做缓存、不做重试。
+- 不把真实数据伪装成 MOCK：`source` 字段恒为 `real`，且不需要调用方推断。
+"""
+
+import json
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import datetime, timezone
+
+
+# --------------------------------------------------------------------------
+# 列白名单
+# --------------------------------------------------------------------------
+# 每一列都对应一个具体用途，没有「先留着以后可能用」的列。
+# 改这里等于改对外契约，改之前想清楚验收方是否知情。
+
+TASK_COLUMNS = ("id", "name", "type", "status", "updated_at")
+
+# 截止时间在这里。注意：`due_date` / `due_at` 不在 `tasks` 表上，
+# 而在 `one_time_reminders` 上（migration `202609150001` §add column）。
+# 这是最容易写错的一处，写错的表现是「截止时间永远为空」而不是报错。
+TASK_REMINDER_COLUMNS = ("task_id", "available_from", "planned_date",
+                         "due_date", "due_at")
+
+TASK_LONG_TERM_COLUMNS = ("task_id", "check_mode", "target_duration_seconds")
+
+TASK_SCHEDULE_COLUMNS = ("task_id", "schedule_type", "weekdays",
+                         "starts_on", "ends_on")
+
+COURSE_COLUMNS = ("id", "name", "status", "semester", "updated_at")
+
+COURSE_RULE_COLUMNS = ("id", "course_id", "weekday", "week_rule_type",
+                       "start_week", "end_week", "interval_weeks",
+                       "week_numbers", "starts_at_minute", "ends_at_minute")
+
+
+# --------------------------------------------------------------------------
+# 枚举转换
+# --------------------------------------------------------------------------
+# 真实库与 MOCK 的命名风格不同，必须显式转换，不能靠字符串相似碰运气。
+#
+#   tasks.type       long_term / one_time        →  MOCK kind: recurring / one_time
+#   week_rule_type   everyWeek / oddWeeks …      →  MOCK: every_week / odd_weeks …
+#
+# `custom` 两侧同名。遇到未知值**不静默兜底**：抛错比猜一个更安全，
+# 因为猜错的结果是排出一份看起来正常、实际错误的课表。
+
+TASK_KIND_BY_TYPE = {"one_time": "one_time", "long_term": "recurring"}
+
+WEEK_RULE_BY_DB = {
+    "everyWeek": "every_week",
+    "oddWeeks": "odd_weeks",
+    "evenWeeks": "even_weeks",
+    "everyNWeeks": "every_n_weeks",
+    "custom": "custom",
+}
+
+
+class RealReadError(Exception):
+    """REAL 读取失败。code 限定在契约 21 码闭集内，不新增码。"""
+
+    def __init__(self, code, message, details=None):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.details = details or []
+
+
+# --------------------------------------------------------------------------
+# 传输层（可注入，便于在没有任何真实凭证的情况下跑测试）
+# --------------------------------------------------------------------------
+
+def urllib_transport(url, headers, timeout):
+    """默认传输：返回 (http_status, body_bytes)。
+
+    只做一次请求，不重试。重试属于调用策略，塞进来会让超时语义变模糊。
+    """
+    req = urllib.request.Request(url, headers=headers, method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.status, resp.read()
+    except urllib.error.HTTPError as exc:
+        return exc.code, exc.read()
+    except Exception as exc:                       # 连接失败/超时/DNS
+        raise RealReadError(
+            "DEPENDENCY_UNAVAILABLE",
+            "无法连接数据源。",
+            [{"field": "transport", "reason": type(exc).__name__}],
+        )
+
+
+class SupabaseReader:
+    """PostgREST 只读客户端。只实现 select，没有写入通道。
+
+    **没有写方法不是遗漏**：REAL-WRITE 需要 M0 另行授权（C 阶段），
+    这里连代码路径都不留，避免哪天被误调用。
+    """
+
+    def __init__(self, base_url, anon_key, access_token, timeout=10, transport=None):
+        if not base_url or not anon_key:
+            raise RealReadError("DEPENDENCY_UNAVAILABLE",
+                                "REAL 数据源未配置（缺 base_url 或 anon key）。")
+        if not access_token:
+            # 这不是配置错误，是运行态过期：access_token 约 1 小时失效。
+            # 报 503 会让运维误以为服务挂了；这里给 401，语义是「要重新授权」。
+            raise RealReadError("AUTH_REQUIRED",
+                                "缺少用户级访问令牌（短期授权可能已过期）。")
+        self.base_url = base_url.rstrip("/")
+        self.anon_key = anon_key
+        self.access_token = access_token
+        self.timeout = timeout
+        self._transport = transport or urllib_transport
+
+    def select(self, table, columns, filters=None, order=None):
+        """读一张表。filters 是 PostgREST 语法片段列表，例如 ["deleted_at=is.null"]。"""
+        params = [("select", ",".join(columns))]
+        for f in (filters or []):
+            k, _, v = f.partition("=")
+            params.append((k, v))
+        if order:
+            params.append(("order", order))
+        url = "%s/rest/v1/%s?%s" % (self.base_url, table,
+                                    urllib.parse.urlencode(params))
+
+        headers = {
+            "apikey": self.anon_key,
+            # 用用户级 JWT，不是 service_role。RLS 靠它识别 auth.uid()。
+            "Authorization": "Bearer " + self.access_token,
+            "Accept": "application/json",
+            # 让 PostgREST 返回精确条数对不上时不要 416，演示场景不需要 count。
+            "Prefer": "return=representation",
+        }
+        status, raw = self._transport(url, headers, self.timeout)
+
+        if status in (401, 403):
+            # 403 在 RLS 语境下通常是「策略拒绝」或「JWT 角色不是 authenticated」。
+            # 两者都归到 AUTH_REQUIRED/FORBIDDEN，不暴露数据库原文。
+            code = "AUTH_REQUIRED" if status == 401 else "FORBIDDEN"
+            raise RealReadError(code, "数据源拒绝了本次读取（令牌无效或无权访问）。",
+                                [{"field": "table", "reason": table}])
+        if status == 404:
+            # 表不存在通常意味着「连到了别的项目」或 migration 未执行。
+            raise RealReadError("DEPENDENCY_UNAVAILABLE", "数据源缺少目标表。",
+                                [{"field": "table", "reason": table}])
+        if status >= 500:
+            raise RealReadError("DEPENDENCY_UNAVAILABLE", "数据源异常。",
+                                [{"field": "table", "reason": str(status)}])
+        if status >= 400:
+            raise RealReadError("DEPENDENCY_UNAVAILABLE", "数据源返回未预期的状态。",
+                                [{"field": "table", "reason": str(status)}])
+
+        try:
+            rows = json.loads(raw.decode("utf-8"))
+        except Exception:
+            raise RealReadError("INTERNAL_ERROR", "数据源返回的不是合法 JSON。",
+                                [{"field": "table", "reason": table}])
+        if not isinstance(rows, list):
+            raise RealReadError("INTERNAL_ERROR", "数据源返回结构不是数组。",
+                                [{"field": "table", "reason": table}])
+        return rows
+
+
+# --------------------------------------------------------------------------
+# 规范化（不改变语义，只处理「数据库有、JSON 不好表达」的三处）
+# --------------------------------------------------------------------------
+
+def _iso(value):
+    """timestamptz → ISO 8601 带偏移。已是字符串就原样。"""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value
+    return value.isoformat()
+
+
+def _date(value):
+    """date → 'YYYY-MM-DD'。
+
+    **不补时间**。`due_date` 的语义是「那一天的截止」，由 migration
+    `202609150001` 的注释原文确定：「Date-only deadline … no synthetic end-of-day time」。
+    补 23:59:59 会把「按天算」变成「按秒算」，排程结果随之改变。
+    """
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value
+    return value.isoformat()[:10]
+
+
+def _deadline_of(reminder):
+    """把 `due_date` / `due_at` 两列收敛成一个显式结构。
+
+    库里已有 `num_nonnulls(due_date, due_at) <= 1` 约束，但这里仍然判断两者共存的情况：
+    约束是 `not valid` 加的（历史行未回填校验），不能假设运行时一定成立。
+    真的同时出现时，**优先 due_at**（更精确），并在 details 里留痕，不静默择一。
+    """
+    if not reminder:
+        return {"kind": "none"}, None
+    due_at = reminder.get("due_at")
+    due_date = reminder.get("due_date")
+    if due_at and due_date:
+        return ({"kind": "exact", "at": _iso(due_at)},
+                "due_date 与 due_at 同时存在，按约定取 due_at；库约束为 not valid，历史行可能违反")
+    if due_at:
+        return {"kind": "exact", "at": _iso(due_at)}, None
+    if due_date:
+        return {"kind": "date_only", "date": _date(due_date)}, None
+    return {"kind": "none"}, None
+
+
+def _week_rule(value):
+    if value is None:
+        return None
+    mapped = WEEK_RULE_BY_DB.get(value)
+    if mapped is None:
+        # 不猜。未知枚举值意味着 schema 变了而本模块没跟上，报错比排出错课表好。
+        raise RealReadError(
+            "INTERNAL_ERROR",
+            "课程周次规则出现未知取值，拒绝猜测。",
+            [{"field": "week_rule_type", "reason": value}],
+        )
+    return mapped
+
+
+def _group_by(rows, key):
+    out = {}
+    for r in rows:
+        out.setdefault(r.get(key), []).append(r)
+    return out
+
+
+# --------------------------------------------------------------------------
+# 对外接口
+# --------------------------------------------------------------------------
+
+class RealRead:
+    """REAL-READ 的两个只读工具实现。
+
+    只做「取 + 规范化」。课程周次展开留给 M2 的模块，这里不重复实现，
+    避免两个模块各自展开、结果不一致 —— 那种不一致在演示现场极难解释。
+    """
+
+    def __init__(self, reader):
+        self.reader = reader
+
+    # -- list_tasks --------------------------------------------------------
+    def list_tasks(self, start, end, kinds=None, statuses=None):
+        kinds = kinds or ["recurring", "one_time"]
+        statuses = statuses or ["active"]
+        as_of = datetime.now(timezone.utc).isoformat()
+
+        task_rows = self.reader.select(
+            "tasks", TASK_COLUMNS,
+            filters=["deleted_at=is.null", "status=in.(%s)" % ",".join(statuses)],
+            order="updated_at.desc",
+        )
+        # 空集立刻返回，不再发后续三张表的请求。
+        # 这既是省一次往返，也是把「空就是空」这件事写在最前面。
+        if not task_rows:
+            return self._tasks_payload([], start, end, as_of, [])
+
+        ids = [r["id"] for r in task_rows]
+        in_filter = "task_id=in.(%s)" % ",".join(ids)
+
+        reminders = _group_by(self.reader.select(
+            "one_time_reminders", TASK_REMINDER_COLUMNS,
+            filters=[in_filter]), "task_id")
+        long_terms = _group_by(self.reader.select(
+            "long_term_tasks", TASK_LONG_TERM_COLUMNS,
+            filters=[in_filter]), "task_id")
+        schedules = _group_by(self.reader.select(
+            "task_schedules", TASK_SCHEDULE_COLUMNS,
+            filters=[in_filter, "deleted_at=is.null"]), "task_id")
+
+        notes = []
+        tasks = []
+        for row in task_rows:
+            kind = TASK_KIND_BY_TYPE.get(row.get("type"))
+            if kind is None or kind not in kinds:
+                continue
+            reminder = (reminders.get(row["id"]) or [None])[0]
+            deadline, warn = _deadline_of(reminder)
+            if warn:
+                notes.append({"task_id": row["id"], "note": warn})
+            tasks.append(self._shape_task(
+                row, kind, deadline, reminder,
+                (long_terms.get(row["id"]) or [None])[0],
+                schedules.get(row["id"]) or [],
+            ))
+        return self._tasks_payload(tasks, start, end, as_of, notes)
+
+    def _shape_task(self, row, kind, deadline, reminder, long_term, schedules):
+        duration = (long_term or {}).get("target_duration_seconds")
+        task = {
+            "task_id": row["id"],
+            "kind": kind,
+            "name": row.get("name"),
+            "status": row.get("status"),
+            "updated_at": _iso(row.get("updated_at")),
+            "deadline": deadline,
+            # 时长只认 `long_term_tasks.target_duration_seconds`。
+            # 真实 schema 里没有「一次性任务的预计耗时」字段，
+            # 所以这里**不估算、不补默认值** —— 字段不存在就不假造（M0 派工原文）。
+            "duration_target_seconds": duration,
+            # execution_mode 由「有没有时长目标」推导，不是库里的独立字段。
+            "execution_mode": "timed" if duration is not None else "untimed",
+        }
+        if kind == "one_time":
+            # 这两个字段只存在于 one_time_reminders，且只对一次性任务有意义。
+            # recurring 任务给 None，不编一个空日期出来。
+            task["available_from"] = _date((reminder or {}).get("available_from"))
+            task["planned_date"] = _date((reminder or {}).get("planned_date"))
+        if schedules:
+            s = schedules[0]
+            task["recurrence"] = {
+                "preset": s.get("schedule_type"),
+                "weekdays": s.get("weekdays") or [],
+                "starts_on": _date(s.get("starts_on")),
+                "ends_on": _date(s.get("ends_on")),
+                # 真实表没有「每天固定几点做」这个字段（scheduled_minute_of_day 在 MOCK 才有），
+                # 保持 None 而不是编一个值。
+                "scheduled_minute_of_day": None,
+            }
+        return task
+
+    def _tasks_payload(self, tasks, start, end, as_of, notes):
+        payload = {
+            "source": "real",
+            "as_of": as_of,
+            "data_window": {"start": start, "end": end},
+            "tasks": tasks,
+            "task_count": len(tasks),
+        }
+        if notes:
+            # 结构性异常不吞掉，但也不升级成错误：数据能读，只是有可疑之处。
+            payload["warnings"] = notes
+        return payload
+
+    # -- get_calendar_events ----------------------------------------------
+    def get_calendar_events(self, start, end, external_fixed_events=None):
+        as_of = datetime.now(timezone.utc).isoformat()
+
+        course_rows = self.reader.select(
+            "courses", COURSE_COLUMNS,
+            filters=["deleted_at=is.null"], order="updated_at.desc")
+        if not course_rows:
+            return self._events_payload([], [], start, end, as_of)
+
+        ids = [r["id"] for r in course_rows]
+        rules = _group_by(self.reader.select(
+            "course_schedule_rules", COURSE_RULE_COLUMNS,
+            filters=["course_id=in.(%s)" % ",".join(ids), "deleted_at=is.null"]),
+            "course_id")
+
+        courses = []
+        for row in course_rows:
+            courses.append({
+                "course_id": row["id"],
+                "name": row.get("name"),
+                "status": row.get("status"),
+                "semester": row.get("semester"),
+                "updated_at": _iso(row.get("updated_at")),
+                "rules": [self._shape_rule(r) for r in rules.get(row["id"], [])],
+            })
+        return self._events_payload(courses, [], start, end, as_of)
+
+    def _shape_rule(self, r):
+        return {
+            "rule_id": r["id"],
+            "weekday": r.get("weekday"),
+            "week_rule_type": _week_rule(r.get("week_rule_type")),
+            "start_week": r.get("start_week"),
+            "end_week": r.get("end_week"),
+            "interval_weeks": r.get("interval_weeks"),
+            "week_numbers": r.get("week_numbers") or [],
+            "start_minute": r.get("starts_at_minute"),
+            "end_minute": r.get("ends_at_minute"),
+        }
+
+    def _events_payload(self, courses, events, start, end, as_of):
+        return {
+            "source": "real",
+            "as_of": as_of,
+            "data_window": {"start": start, "end": end},
+            "courses": courses,
+            # `events` 是「已展开成具体日期时段」的结果。本模块**不展开**，
+            # 因此这里恒为空数组，而不是拿规则凑一个出来。
+            # 展开由 M2 的模块提供，调用方组合后填入。
+            "events": events,
+            "events_unavailable_reason": "week_expansion_not_implemented_here",
+            "daily_overrides": [],
+        }

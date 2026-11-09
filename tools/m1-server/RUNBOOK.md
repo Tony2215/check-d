@@ -317,3 +317,70 @@ if not cands:
 为什么必须显式给：M0 2026-11-09T10:51 要求「必须清晰区分 REAL-READ / MOCK-SCHEDULE / REAL-WRITE」，
 而 M3 实测 `generate` 载荷里 `mock` 出现 **0 次**，唯一可辨识痕迹是 `approval_url` 的域名——
 靠域名去猜是不是假数据太脆，验收方不该做这种推断。
+
+## 十三、REAL-READ（隔离开发件，2026-11-09 新增）
+
+**默认全关。** 现网 `/mcp`、`/tools/*`、`/health` 四键档行为零变化。
+
+### 两条路径，物理隔离
+
+| 路径 | 数据源 | 鉴权头 | 工具数 |
+|---|---|---|---|
+| `/mcp`、`/tools/*` | MOCK（内置 4 条） | `X-Demo-Token` 或 `Authorization` | 7 |
+| `/real/mcp`、`/real/tools/*` | M0 账号已同步的 Supabase 数据 | **只认 `X-Real-Token`** | 2（`list_tasks`、`get_calendar_events`） |
+
+**反向隔离**：`X-Demo-Token` 开不了 REAL，`X-Real-Token` 也开不了 MOCK。
+理由不是洁癖——`X-Demo-Token` 在 2026-11-08 已写进邮件、进过交付件、在多人手里，
+若它能开 REAL，「两套凭证」就只剩命名区别。两个方向都有测试钉住
+（`tests/test_real_path_http.py::TestReverseIsolation`）。
+
+### 环境变量
+
+| 变量 | 作用 | 未设时的行为 |
+|---|---|---|
+| `CHECKD_REAL_ENABLED` | `1` 才启用 | `/real/*` 一律 503 |
+| `CHECKD_REAL_TOKEN` | REAL 访问口令 | 503（fail-closed） |
+| `CHECKD_REAL_SUPABASE_URL` | 形如 `https://<ref>.supabase.co` | 调用时 503 |
+| `CHECKD_REAL_ANON_KEY` | 公开 anon key（本来就要打进客户端） | 调用时 503 |
+| `CHECKD_REAL_JWT` | 用户级 access_token | 调用时 401 `AUTH_REQUIRED` |
+| `CHECKD_REAL_WINDOW` | 形如 `14:00-16:00`，留空不限 | 格式非法时**拒绝**（不当作未配置） |
+
+### 令牌怎么更新（M0 手动，不是自动续期）
+
+```bash
+curl -X POST https://checkd-agent-tools.app.workbuddy.host/admin/real-token \
+  -H "X-Admin-Key: <管理口令>" -H "Content-Type: application/json" \
+  -d '{"access_token":"<本机取到的新令牌>"}'
+```
+
+- 只驻**内存**，进程重启后回到 `CHECKD_REAL_JWT` 的值（可能已过期）。
+- 入口会拒掉：非 JWT 形状、载荷无 `exp`、已过期。收下这些只会让后续 401 被误判成配置错。
+- 响应只回过期时刻，**不回显令牌本体或任何一段**。
+
+### 已知边界（不得写成已实现）
+
+1. **课程周次展开不在这里**。`get_calendar_events` 的 `events` 恒为空数组并带
+   `events_unavailable_reason=week_expansion_not_implemented_here`。
+   展开归 M2（M0 2026-11-09T14:08 派工原文）。
+2. **不做 Task/Course → Agent 结构的语义转换**，同样归 M2。本层只做字段白名单 + 枚举规范化。
+3. **一次性任务的预计耗时真实 schema 里没有**（只有 `long_term_tasks.target_duration_seconds`），
+   因此 `duration_target_seconds` 可能为 `null`、`execution_mode` 随之是 `untimed`。**不估算、不补默认值。**
+4. **读到的是云同步副本，不是设备实时状态**。未同步的改动看不到。这是本地优先架构的必然，不是缺陷。
+5. **不设 `user_id` 条件**，隔离完全靠 RLS。若部署时误用 `service_role`，本模块自身察觉不到 ——
+   防线在密钥选择上（这条已写进 M0 操作清单）。
+6. **没有真实账号读取的 PASS 证据。** 全部证据来自构造数据 + 假 PostgREST。
+
+### 跑测试（不需要任何真实凭证）
+
+```bash
+python -m unittest discover -s tools/m1-server/tests
+```
+
+其中与 REAL 相关的四份：
+
+| 文件 | 项数 | 钉住什么 |
+|---|---|---|
+| `test_real_read.py` | 28 | 字段映射、白名单、错误码、空集不回落、不传 user_id |
+| `test_real_path_http.py` | 21 | 反向隔离、工具面、失败不回落、窗口、现网回归 |
+| `test_real_end_to_end.py` | 8 | 假 PostgREST 端到端：JWT 透传、信封形状、`data.tasks` |
+| `test_real_token_update.py` | 9 | 令牌注入入口：鉴权、形状校验、不回显 |
