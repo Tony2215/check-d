@@ -329,6 +329,57 @@ def _iso_from_epoch(epoch):
         return None
 
 
+# ---- 运行时标记（判定「容器重启时磁盘是否沿用」的唯一用途）--------------
+# **刻意用懒加载**：这一小块是临时诊断能力，如果哪天没打进部署包，
+# 也只有这两个端点报「不可用」，不能让整个服务启动即崩
+# （11-08 就吃过「模块没打包 → 500」的亏）。
+_PKG_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def _marker_module():
+    import runtime_marker
+    return runtime_marker
+
+
+def _marker_envelope(extra):
+    """统一带上「是哪个进程写的/读的」，否则重启前后两份结果没法对齐。"""
+    out = {
+        "pid": os.getpid(),
+        "boot_at": _BOOT_AT,
+        "uptime_seconds": int(time.time() - _BOOT_TS),
+        "note": "本接口只用于判定容器重启后磁盘是否沿用；不涉及任何凭据。",
+    }
+    out.update(extra)
+    return out
+
+
+def _marker_write():
+    try:
+        rm = _marker_module()
+    except Exception:
+        return _marker_envelope({"ok": False, "reason": "runtime_marker_missing"})
+    return _marker_envelope({"ok": True, "action": "write",
+                             **rm.write_markers(_PKG_DIR)})
+
+
+def _marker_read():
+    try:
+        rm = _marker_module()
+    except Exception:
+        return _marker_envelope({"ok": False, "reason": "runtime_marker_missing"})
+    return _marker_envelope({"ok": True, "action": "read",
+                             **rm.read_markers(_PKG_DIR)})
+
+
+def _marker_clean():
+    try:
+        rm = _marker_module()
+    except Exception:
+        return _marker_envelope({"ok": False, "reason": "runtime_marker_missing"})
+    return _marker_envelope({"ok": True, "action": "clean",
+                             **rm.clean_markers(_PKG_DIR)})
+
+
 def _fp(secret):
     """口令指纹：只用于核对"环境变量是不是这份值"，不可逆，不泄露明文。"""
     if not secret:
@@ -1225,6 +1276,17 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, _env_diag())
             return
 
+        if path == "/admin/marker":
+            # 运行时标记文件的读回入口。**只读，不写。**
+            # 为什么要有它：2026-11-10 实测容器会在没有任何发布的情况下自行重启
+            # （15:38:03Z、15:55:34Z 两次），所以「容器重启时磁盘是否沿用」
+            # 成了决定「令牌能不能落盘」的唯一事实前提。这个端点只回答这个事实问题。
+            # 它不接触任何凭据，写进文件的只有随机无用字符。详见 runtime_marker.py。
+            if not self._admin_ok():
+                return
+            self._send(200, _marker_read())
+            return
+
         if path == "/tools":
             if not self._auth_ok():
                 return
@@ -1270,6 +1332,30 @@ class Handler(BaseHTTPRequestHandler):
                 _STATS["calls"] = 0
                 _STATS["errors"] = 0
             self._send(200, {"ok": True, "reset": True, "counts": counts})
+            return
+
+        if path == "/admin/marker":
+            # 写 / 清理运行时标记。**只写随机无用字符**，不写任何凭据。
+            # 一次发布只跑一次 write；读回走 GET /admin/marker。
+            if not self._admin_ok():
+                return
+            try:
+                payload = self._json_body()
+            except _BodyTooLarge as exc:
+                self._body_too_large(exc)
+                return
+            except Exception:
+                self._fail(400, "INVALID_ARGUMENT", "请求体不是合法 JSON。")
+                return
+            action = (payload or {}).get("action")
+            if action == "write":
+                self._send(200, _marker_write())
+                return
+            if action == "clean":
+                self._send(200, _marker_clean())
+                return
+            self._fail(400, "INVALID_ARGUMENT",
+                       "action 只接受 write 或 clean。")
             return
 
         if path == "/admin/real-token":
