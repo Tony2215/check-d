@@ -376,6 +376,19 @@ curl -X POST https://checkd-agent-tools.app.workbuddy.host/admin/real-token \
 python -m unittest discover -s tools/m1-server/tests
 ```
 
+### 一条命令出「可粘贴的实跑日志」（给复核人用）
+
+```bash
+python tools/m1-server/verify_real_isolated.py
+```
+
+起本地进程打七个场景（REAL 未启用／无凭证／错凭证／演示口令打 REAL／正确口令+源不可用／
+真实口令打 MOCK／MOCK 回归），打印表格 + 判定，**全部符合预期 exit 0**。
+
+这份东西的用途是：复核人的本机若被权限拦、跑不了动态测试，可以直接看这份日志，
+或在他自己机器上跑出同样一份贴进核验件。它只证「两条路径鉴权互不串门、失败不回落 MOCK」，
+**不证**真实账号数据读取。
+
 其中与 REAL 相关的四份：
 
 | 文件 | 项数 | 钉住什么 |
