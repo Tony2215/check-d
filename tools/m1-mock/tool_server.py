@@ -466,6 +466,35 @@ def schedule(payload, prefs):
     day_start = int(prefs.get("day_start_minute", 8 * 60))
     day_end = int(prefs.get("day_end_minute", 22 * 60))
     min_block = int(prefs.get("minimum_block_minutes", 30))
+
+    # 窗口落在过去：先把起点夹到今天，整体在过去就直接判参数错。
+    # M2 2026-11-10T01:37 实测缺陷：range=11-09、now=11-10 09:00 时，
+    # 旧实现照排 11-09 08:00-09:00 —— 把块排进了过去，而且这些块是可审批的。
+    # 之前只处理了「今天」这一种（today_floor），对「比今天更早的日期」完全没拦。
+    _now_local = now().astimezone(TZ)
+    today = _now_local.date()
+    if end < today:
+        # 窗口整体在过去：不排块，但**不抛参数错** —— range 本身合法（start<=end、
+        # 不超过 31 天），只是没有未来时间可用。调用方要的是「为什么不排」，不是「请求非法」。
+        # 与 Dart 引擎对齐（M2 2026-11-10T01:37 报的缺陷 1）：拒绝排 + 给未排出口。
+        # 用闭集内已有的 NO_AVAILABILITY，不新增 violation code。
+        rows = []
+        for t in payload["tasks"]:
+            if t.get("status") != "active":
+                continue
+            rows.append(unplanned_item(
+                t["task_id"], t["kind"], "NO_AVAILABILITY",
+                "排程窗口整体在过去（%s 至 %s，今天 %s），未生成任何块。"
+                % (start.isoformat(), end.isoformat(), today.isoformat()),
+                {"rule": "窗口整体在过去时不产生任何块",
+                 "window": {"start": start.isoformat(), "end": end.isoformat()},
+                 "today": today.isoformat()},
+                ["把日期范围改到今天或之后再重新生成"],
+                max(int((t.get("duration_target_seconds") or 0) // 60), 1)))
+        return [], [], rows, []
+    if start < today:
+        start = today
+
     fixed = [e for e in calendar_events_for(payload) if e["fixed"]]
     blocks, changes, unplanned = [], [], []
     already_done = []   # 当天已完成任务的 task_id，按出现顺序去重
@@ -499,11 +528,10 @@ def schedule(payload, prefs):
             continue
         (ones if t["kind"] == "one_time" else recurring).append(t)
 
-    # 今天这一刻：候选起点不得早于现在。
+    # 今天这一刻的起点下限：候选起点不得早于现在。
     # M3 2026-11-06 03:46:27Z 实测发现：now=11:44 时把 4 小时任务排成 08:00-12:00，
     # 块起点落在过去。起点按 5 分钟向上取整。
-    _now_local = now().astimezone(TZ)
-    today = _now_local.date()
+    # `_now_local` / `today` 已在函数开头取过（那里还要用来拦「窗口整体在过去」）。
     today_floor = ((_now_local.hour * 60 + _now_local.minute + 4) // 5) * 5
 
     for t in sorted(ones, key=deadline_key):
