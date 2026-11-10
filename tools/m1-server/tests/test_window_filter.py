@@ -236,7 +236,7 @@ class TestBaselineVersusWindow(unittest.TestCase):
 
 
 class TestOverdueNotSwallowedByWindow(unittest.TestCase):
-    """M3 2026-11-10 20:50 指出的矛盾：逾期条件里多写了一个 `d < start`。
+    """M3 2026-11-10 20:26 指出的矛盾：逾期条件里多写了一个 `d < start`。
 
     原写法 `d < today AND d < start`：当**窗口起点早于截止日**时（例如查 10 月整月，
     而任务 10-11 截止、今天 11-10），逾期判定不成立，任务落到 `in_window` 分支，
@@ -324,7 +324,7 @@ class TestOverdueNotSwallowedByWindow(unittest.TestCase):
         """真实五条在 11-11~11-18 窗口下的正确基准：5 / 1 / 4 / 0 / 0。
 
         **T5「拿月饼」有 planned_date=2026-09-24，不是 undated。**
-        2026-11-10 20:24 与 20:48 两轮沟通里，M3 与我都曾把它当 undated，
+        2026-11-10 先前两轮沟通里，M3 与我都曾把它当 undated，
         得出错数 5 / 1 / 3 / 1 / 0。按 `_task_dates()` 的定义，planned 非空
         就不落 undated；又因 planned < today，应判 overdue。
         """

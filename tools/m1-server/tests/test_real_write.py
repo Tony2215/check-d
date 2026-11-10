@@ -159,7 +159,7 @@ class TestOptimisticLock(unittest.TestCase):
     def test_old_name_is_url_encoded(self):
         """旧名里的保留字符必须处理两层，否则能把 WHERE 改成别的条件。
 
-        M3 2026-11-10 20:50 指出：只做百分号编码不够 —— PostgREST 先 URL 解码
+        M3 2026-11-10 20:26 指出：只做百分号编码不够 —— PostgREST 先 URL 解码
         再解析 filter，`%2C` 解回逗号仍会被当条件分隔符。所以还要双引号包裹。
         """
         t = Rec(rows=ok_row(name="物理实验"))
