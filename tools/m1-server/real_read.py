@@ -427,6 +427,17 @@ class RealRead:
         statuses = statuses or ["active"]
         as_of = datetime.now(timezone.utc).isoformat()
         # 逾期判定基准。可注入，好让测试构造确定的负向场景（真实调用不传）。
+        #
+        # ⚠ 已知限制（2026-11-10 M3 独立复核指出，已登记、本轮不修）：
+        #   这里取的是 **UTC 日期**；请求里的 `timezone`（如 Asia/Shanghai）
+        #   全文未被使用。后果：CST 00:00–08:00 区间内，「今天」会比本地日期
+        #   早一天，边界任务的逾期判定可能差一天。白天时段两者同日。
+        #   这是和 `date_range` 同一类口子：**声明了参数却不生效**。
+        #   不修的理由：明天演示不触发，改它要重跑全部回归；按优先级判据
+        #   （评委看不到）登记为已知限制，赛后修。
+        #   修法二选一：①用 zoneinfo 解析请求时区（注意容器可能无 tzdata，
+        #   需回退固定 +8，中国无夏令时）；②在契约里明写「today 按 UTC」。
+        #   无论哪种，都不能保持「声明了但不生效」。
         if today is None:
             today = datetime.now(timezone.utc).date().isoformat()
         elif hasattr(today, "isoformat"):

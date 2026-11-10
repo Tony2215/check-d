@@ -269,14 +269,15 @@ class TestOverdueNotSwallowedByWindow(unittest.TestCase):
         self.assertEqual(by_name(out)["交报告"]["window_status"], rr.WINDOW_IN)
 
     def test_real_fixture_distribution_11_11_to_11_18(self):
-        """按 M3 给的预期：11-11~11-18 窗口应为 in_window 5 / overdue 1 / undated 3 / 排除 0。
+        """三类归属同时出现时，计数各自落到对应桶，且逾期不被窗口吞掉。
 
-        用真实数据的五条任务形态复现（不连库）：
-        - 循环每日、无终点           → in_window
-        - 一次性 截止 2026-10-11     → overdue
-        - 一次性 截止 2026-10-10     → overdue（M3 记 1，实际三条逾期）
-        这里只钉「逾期不被窗口吞掉」这一条性质，不复制她的具体计数，
-        因为计数依赖 today 取值，跨日会变。
+        **本测试用构造夹具，不是真实数据的形态**，只验证分类行为本身。
+        真实数据五条的基准见 test_real_five_tasks_baseline_1_4_0_0。
+
+        历史教训（2026-11-10）：本 docstring 曾经把上游给的预期计数
+        「in_window 5 / overdue 1 / undated 3」抄进来，而那个数字是错的
+        （真实为 1 / 4 / 0 / 0）。**测试注释里不要抄具体计数**——错数会
+        跟着代码历史一起传给下一届，且看起来像权威结论。
         """
         tasks = [task(tid="uuid-t1", name="循环", ttype="long_term"),
                  task(tid="uuid-t2", name="逾期A"),
@@ -293,6 +294,74 @@ class TestOverdueNotSwallowedByWindow(unittest.TestCase):
         self.assertEqual(c["overdue"], 1)
         self.assertEqual(c["undated"], 1)
         self.assertEqual(c["excluded_out_of_window"], 0)
+
+    # ----------------------------------------------------------------------
+    # 真实数据基准（2026-11-10 19:07 那次真实读取的形态）
+    # ----------------------------------------------------------------------
+
+    def _real_five(self):
+        """复现真实数据五条的**形态**（不是名称，脱敏后按 T1..T5 编号）。
+
+        真相来自 docs/evidence/realread-2026-11-10T11-07Z.redacted.json：
+        T1 循环每日无终点；T2/T3/T4 一次性、截止 10-10/10-11/10-17；
+        T5 一次性、**有 planned_date 2026-09-24** 但没有截止日。
+        """
+        tasks = [task(tid="uuid-t1", name="T1", ttype="long_term"),
+                 task(tid="uuid-t2", name="T2"),
+                 task(tid="uuid-t3", name="T3"),
+                 task(tid="uuid-t4", name="T4"),
+                 task(tid="uuid-t5", name="T5")]
+        reminders = [{"task_id": "uuid-t2", "due_date": "2026-10-11"},
+                     {"task_id": "uuid-t3", "due_date": "2026-10-10"},
+                     {"task_id": "uuid-t4", "due_date": "2026-10-17"},
+                     {"task_id": "uuid-t5", "planned_date": "2026-09-24"}]
+        schedules = [{"task_id": "uuid-t1", "schedule_type": "daily",
+                      "weekdays": [1, 2, 3, 4, 5, 6, 7],
+                      "starts_on": "2026-09-01", "ends_on": None}]
+        return tasks, reminders, schedules
+
+    def test_real_five_tasks_baseline_1_4_0_0(self):
+        """真实五条在 11-11~11-18 窗口下的正确基准：5 / 1 / 4 / 0 / 0。
+
+        **T5「拿月饼」有 planned_date=2026-09-24，不是 undated。**
+        2026-11-10 20:24 与 20:48 两轮沟通里，M3 与我都曾把它当 undated，
+        得出错数 5 / 1 / 3 / 1 / 0。按 `_task_dates()` 的定义，planned 非空
+        就不落 undated；又因 planned < today，应判 overdue。
+        """
+        tasks, reminders, schedules = self._real_five()
+        out = run(tasks, reminders=reminders, schedules=schedules,
+                  window=("2026-11-11", "2026-11-18"), today="2026-11-10")
+        c = out["window_counts"]
+        self.assertEqual(c["in_window"], 1, "只有 T1 循环落在窗口内")
+        self.assertEqual(c["overdue"], 4, "T2/T3/T4 截止已过 + T5 计划日已过")
+        self.assertEqual(c["undated"], 0, "T5 有 planned_date，不是无日期")
+        self.assertEqual(c["excluded_out_of_window"], 0)
+        self.assertEqual(len(out["tasks"]), 5)
+        self.assertEqual(by_name(out)["T5"]["window_status"], rr.WINDOW_OVERDUE)
+
+    def test_real_data_window_filtering_not_observable(self):
+        """真实五条在**任何**窗口下分布都相同 ⇒ 不能用它证明窗口生效。
+
+        原因：T1 循环无终点覆盖所有窗口；T2–T5 全部早于今天恒为 overdue。
+        所以 `out_of_window` 与 `undated` 在这批数据上不可达。
+
+        **这条断言的作用是防止把「换个窗口看分布变化」当演示证据。**
+        真要现场演示筛选，必须先有一条未来截止日的任务。
+        """
+        tasks, reminders, schedules = self._real_five()
+        seen = set()
+        for window in (("2026-10-01", "2026-10-31"),
+                       ("2026-11-11", "2026-11-18"),
+                       ("2026-12-01", "2026-12-31"),
+                       ("2027-06-01", "2027-06-30")):
+            out = run(tasks, reminders=reminders, schedules=schedules,
+                      window=window, today="2026-11-10")
+            c = out["window_counts"]
+            seen.add((c["in_window"], c["overdue"], c["undated"],
+                      c["excluded_out_of_window"]))
+        self.assertEqual(seen, {(1, 4, 0, 0)},
+                         "四窗口分布必须完全一致 —— 一致才说明「分布法不可用」，"
+                         "若这里变了，说明分类逻辑改了，要重新评估演示口径")
 
 
 if __name__ == "__main__":
