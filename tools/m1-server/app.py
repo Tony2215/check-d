@@ -57,6 +57,16 @@ except Exception as _exc:                       # pragma: no cover - 正常环�
     real_read = None
     _REAL_IMPORT_ERROR = _exc
 
+# 写入模块与读取模块**分开导入、分开失败**。
+# 读取挂了不该连累写入的报错口径，反之亦然；而且写入模块 import 失败时
+# 必须让 `update_task_name` 走「未启用」而不是「未加载」，否则运维会去查依赖。
+try:
+    import real_write  # noqa: E402
+    _REAL_WRITE_IMPORT_ERROR = None
+except Exception as _exc:                       # pragma: no cover
+    real_write = None
+    _REAL_WRITE_IMPORT_ERROR = _exc
+
 SERVICE_NAME = "checkd-agent-tools"
 SERVICE_VERSION = "1.0.0"
 
@@ -226,6 +236,14 @@ REAL_WINDOW = os.environ.get("CHECKD_REAL_WINDOW", "").strip()
 # REAL 侧只挂两个只读工具。其余五个**不出现在 tools/list 里**，
 # 而不是出现后返回错误——Agent 看不到就无从误调，比让它先试一次再报错干净。
 REAL_TOOL_NAMES = ("list_tasks", "get_calendar_events")
+
+# REAL-WRITE 开关，**默认关**。
+# M0 2026-11-10T12:07 原文：「本邮件仅授权代码级准备与隔离测试，
+# 不批准生产 PATCH/UPDATE，不批准 RLS/DDL 变更，不批准发布/重启现网」。
+# 所以写入能力必须是「显式打开才存在」，而不是「默认存在但拦一下」——
+# 后者只要有一处判断写漏就会漏到生产。
+REAL_WRITE_ENABLED = os.environ.get("CHECKD_REAL_WRITE", "0") == "1"
+REAL_WRITE_TOOL = "update_task_name"
 
 
 def _in_real_window(now=None):
@@ -886,6 +904,11 @@ def _real_call(name, args):
     code = None
     request_id = args.get("request_id") if isinstance(args, dict) else None
 
+    # 写入工具在这里就分岔：它没有 `date_range`，进读取那套参数校验
+    # 只会得到一句「date_range 必填」，掩盖真正的错。
+    if name == REAL_WRITE_TOOL:
+        return _real_write_call(args, trace, request_id, started)
+
     # 参数校验复用与 MOCK 完全相同的一份，避免两条路径对同一个错参数给出不同结论。
     bad = _validate_input(name, args)
     if bad is not None:
@@ -960,11 +983,105 @@ def _real_call(name, args):
     return status, body
 
 
-def _real_tool_defs():
-    """REAL 侧对外的工具清单：只有两个只读工具。
+def _real_write_call(args, trace, request_id, started):
+    """REAL-WRITE 的唯一执行入口。返回 (http_status, body)。
 
-    其余五个不出现，而不是出现后报错 —— Agent 看不到就无从误调。
-    描述前缀 `[REAL]` 让模型能区分同名工具的两个版本（MOCK / 真实数据）。
+    **与 `_real_call` 分开写。** 那条路径全是读，任何异常都可以「报告失败」收尾；
+    这条会改数据，所以顺序必须是：先挡开关、再挡加载、再挡参数、最后才发请求。
+    顺序错了就等于给了一条绕过确认的缝。
+
+    证据记录**不写名称原文**：任务名是用户内容，写进 `_EVIDENCE` 就会跟着
+    `/diag` 或导出一起流出去。只记长度与是否变化。
+    """
+    ok = False
+    code = None
+    payload = None
+    try:
+        # 1) 开关。未启用时**连参数都不看**——不给出「参数错」这类可试探的反馈。
+        if not REAL_WRITE_ENABLED:
+            raise real_read.RealReadError(
+                "WRITE_BLOCKED", "真实写入通道未启用。",
+                [{"field": "CHECKD_REAL_WRITE", "reason": "disabled"}])
+
+        # 2) 模块加载
+        if real_write is None:
+            raise real_read.RealReadError(
+                "DEPENDENCY_UNAVAILABLE", "写入模块未加载。",
+                [{"field": "import", "reason": str(_REAL_WRITE_IMPORT_ERROR)}])
+
+        # 3) 令牌。没有用户身份就不该往下走，避免匿名请求打到 RLS 再回一个误导性的 401。
+        if not _current_real_jwt():
+            raise real_read.RealReadError(
+                "AUTH_REQUIRED", "缺少用户级访问令牌，无法执行写入。",
+                [{"field": "access_token", "reason": "missing"}])
+
+        inp = args.get("input") if isinstance(args, dict) else None
+        if not isinstance(inp, dict):
+            raise real_read.RealReadError(
+                "INVALID_ARGUMENT", "缺少 input 对象。",
+                [{"field": "input", "reason": "missing"}])
+
+        writer = real_write.RealWrite(REAL_SUPABASE_URL, REAL_ANON_KEY,
+                                      _current_real_jwt())
+        payload = writer.update_task_name(
+            task_id=inp.get("task_id"),
+            new_name=inp.get("new_name"),
+            expected_old_name=inp.get("expected_old_name"),
+            # 只有字面量 true 算确认。`"true"`、`1`、`"yes"` 一律不放行。
+            confirm=inp.get("confirm") is True,
+        )
+
+        body = mock.envelope(request_id, "success", {"data": payload})
+        body["trace_id"] = "trace_" + trace
+        body["source"] = "real"
+        body["data_source"] = "supabase"
+        status = 200
+        ok = True
+    except Exception as exc:
+        code = getattr(exc, "code", None)
+        if not (code and errs.is_known_code(code)):
+            sys.stderr.write("REAL write %s failed:\n%s"
+                             % (args.get("tool") if isinstance(args, dict) else "?",
+                                traceback.format_exc()))
+            code = "INTERNAL_ERROR"
+        msg = getattr(exc, "message", None) or "真实写入失败。"
+        details = getattr(exc, "details", None) or []
+        body = errs.to_envelope(code, msg, request_id=request_id,
+                                trace_id=trace, details=details)
+        body["source"] = "real"
+        status = errs.http_status(code)
+
+    # 证据条目：脱敏。名称只留长度，"改没改"用布尔表示。
+    entry = {"ts": _now(), "trace_id": trace, "tool": REAL_WRITE_TOOL,
+             "ok": ok, "error_code": code,
+             "duration_ms": int((time.time() - started) * 1000),
+             "source": "real", "write_kind": "task_name"}
+    if isinstance(args, dict):
+        inp = args.get("input") or {}
+        if isinstance(inp, dict):
+            tid = inp.get("task_id")
+            entry["task_id_prefix"] = (str(tid)[:8] + "…") if tid else None
+            nn = inp.get("new_name")
+            on = inp.get("expected_old_name")
+            entry["new_name_len"] = len(nn) if isinstance(nn, str) else None
+            entry["old_name_len"] = len(on) if isinstance(on, str) else None
+            entry["confirmed"] = inp.get("confirm") is True
+    with _LOCK:
+        _STATS["calls"] += 1
+        if not ok:
+            _STATS["errors"] += 1
+        _EVIDENCE.append(entry)
+        if len(_EVIDENCE) > _EVIDENCE_CAP:
+            del _EVIDENCE[:len(_EVIDENCE) - _EVIDENCE_CAP]
+    return status, body
+
+
+def _real_tool_defs():
+    """REAL 侧对外的工具清单。
+
+    默认只有两个只读工具。其余五个不出现，而不是出现后报错 ——
+    Agent 看不到就无从误调。
+    写入工具**仅在 `CHECKD_REAL_WRITE=1` 时出现**：能力不存在比能力存在但被拦更安全。
     """
     out = []
     for spec in mock.tool_defs():
@@ -972,6 +1089,32 @@ def _real_tool_defs():
             spec = dict(spec)
             spec["description"] = "[REAL] " + (spec.get("description") or "")
             out.append(spec)
+    if REAL_WRITE_ENABLED:
+        out.append({
+            "name": REAL_WRITE_TOOL,
+            "description": (
+                "[REAL] 修改一条任务的名称。**会真实写入云端数据库。**"
+                "只允许 M0 明确指定的一条专用测试任务，只改 name 一个字段。"
+                "必须带 confirm=true 逐次确认；expected_old_name 必须与当前名称一致，"
+                "否则不写入并返回 SNAPSHOT_CONFLICT（用于防止并发覆盖与重复应用）。"
+            ),
+            "inputSchema": {
+                "type": "object",
+                "required": ["task_id", "new_name", "expected_old_name", "confirm"],
+                "properties": {
+                    "task_id": {"type": "string",
+                                "description": "目标任务的 UUID（必填）。"},
+                    "new_name": {"type": "string",
+                                 "minLength": 1, "maxLength": 100,
+                                 "description": "新名称，1–100 字符。"},
+                    "expected_old_name": {"type": "string",
+                                          "description": "当前名称。与服务端不一致时不写入。"},
+                    "confirm": {"type": "boolean",
+                                "description": "必须为 true，表示本次已获用户明确同意。"},
+                },
+                "additionalProperties": False,
+            },
+        })
     return out
 
 

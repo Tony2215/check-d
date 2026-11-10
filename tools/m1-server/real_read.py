@@ -330,6 +330,78 @@ def _group_by(rows, key):
 
 
 # --------------------------------------------------------------------------
+# 窗口判定（契约 §6.1「date_range：实际查询范围」）
+# --------------------------------------------------------------------------
+#
+# 背景：2026-11-10 M3 复核指出 `start`/`end` 只被写进 `data_window` 回显、
+# 从未参与筛选（原 L354 过滤只有 deleted_at/status 两个条件）。M0 同日裁定
+# 「口径乙：严格筛选，但逾期任务必须单列」。
+#
+# 三个类别各有独立语义，不可合并：
+#   in_window     落在查询窗口内，可被引擎排入未来时段
+#   overdue       截止日已过且仍未完成 —— 必须返回给用户看，但**绝不可**排进未来
+#   undated       没有任何日期约束 —— 随时可排，丢弃它等于静默漏排
+# 窗口外且未逾期的（未来才到期）不返回，这是「窗口真生效」的唯一体现。
+
+WINDOW_IN = "in_window"
+WINDOW_OVERDUE = "overdue"
+WINDOW_UNDATED = "undated"
+WINDOW_OUT = "out_of_window"
+
+
+def _task_dates(task):
+    """取任务的 (计划日, 截止日)，都是 'YYYY-MM-DD' 或 None。
+
+    一次性任务的日期在 `one_time_reminders` 上，不在 `tasks` 上；循环任务没有
+    单点日期，只有 recurrence 的起止。两者不能混用同一个字段名。
+    """
+    planned = task.get("planned_date")
+    dl = task.get("deadline") or {}
+    kind = dl.get("kind")
+    if kind == "date_only":
+        due = dl.get("date")
+    elif kind == "exact":
+        # 带时刻的字符串取日期部分按天比，与 `_date` 的「不补时间」口径一致。
+        due = (dl.get("at") or "")[:10] or None
+    else:
+        due = None
+    return planned, due
+
+
+def _classify_task(task, start, end, today):
+    """判定一个 Task 属于哪个窗口类别，返回 (status, reason)。
+
+    `reason` 是给人看的一句话，会被原样放进响应，所以写中文、不带行话。
+    """
+    if task.get("kind") == "recurring":
+        rec = task.get("recurrence") or {}
+        s, e = rec.get("starts_on"), rec.get("ends_on")
+        # 循环规则与窗口有没有交集；ends_on 为空表示一直持续。
+        if (not s or s <= end) and (not e or e >= start):
+            return WINDOW_IN, "循环规则覆盖查询窗口"
+        if e and e < start and e < today:
+            return WINDOW_OVERDUE, "循环规则在 %s 已结束，且早于今天" % e
+        return WINDOW_OUT, "循环规则不覆盖查询窗口"
+
+    planned, due = _task_dates(task)
+
+    if not planned and not due:
+        return WINDOW_UNDATED, "未设置计划日与截止日，无法判断落在哪个时段"
+
+    # 逾期优先于窗口：逾期任务必须单独可见，不能被"窗口外"悄悄吃掉。
+    for d, label in ((due, "截止日"), (planned, "计划日")):
+        if d and d < today and d < start:
+            return WINDOW_OVERDUE, "%s %s 已过期，不再排入未来时段" % (label, d)
+
+    for d, label in ((planned, "计划日"), (due, "截止日")):
+        if d and start <= d <= end:
+            return WINDOW_IN, "%s %s 落在查询窗口内" % (label, d)
+
+    return WINDOW_OUT, "计划日与截止日都在查询窗口之外"
+
+
+
+# --------------------------------------------------------------------------
 # 对外接口
 # --------------------------------------------------------------------------
 
@@ -344,10 +416,15 @@ class RealRead:
         self.reader = reader
 
     # -- list_tasks --------------------------------------------------------
-    def list_tasks(self, start, end, kinds=None, statuses=None):
+    def list_tasks(self, start, end, kinds=None, statuses=None, today=None):
         kinds = kinds or ["recurring", "one_time"]
         statuses = statuses or ["active"]
         as_of = datetime.now(timezone.utc).isoformat()
+        # 逾期判定基准。可注入，好让测试构造确定的负向场景（真实调用不传）。
+        if today is None:
+            today = datetime.now(timezone.utc).date().isoformat()
+        elif hasattr(today, "isoformat"):
+            today = today.isoformat()
 
         task_rows = self.reader.select(
             "tasks", TASK_COLUMNS,
@@ -386,12 +463,19 @@ class RealRead:
             deadline, warn = _deadline_of(reminder)
             if warn:
                 notes.append({"task_id": row["id"], "note": warn})
-            tasks.append(self._shape_task(
+            shaped = self._shape_task(
                 row, kind, deadline, reminder,
                 (long_terms.get(row["id"]) or [None])[0],
                 schedules.get(row["id"]) or [],
-            ))
-        return self._tasks_payload(tasks, start, end, as_of, notes)
+            )
+            shaped["window_status"], shaped["window_reason"] = _classify_task(
+                shaped, start, end, today)
+            tasks.append(shaped)
+        # 只丢弃「窗口外且未逾期」这一类。逾期与未设日期都保留并单列 ——
+        # 前者是用户最需要看到的东西，后者丢弃等于静默漏排（M0 2026-11-10 裁定原文）。
+        kept = [t for t in tasks if t["window_status"] != WINDOW_OUT]
+        return self._tasks_payload(kept, start, end, as_of, notes,
+                                   excluded=len(tasks) - len(kept))
 
     def _shape_task(self, row, kind, deadline, reminder, long_term, schedules):
         duration = (long_term or {}).get("target_duration_seconds")
@@ -427,13 +511,29 @@ class RealRead:
             }
         return task
 
-    def _tasks_payload(self, tasks, start, end, as_of, notes):
+    def _tasks_payload(self, tasks, start, end, as_of, notes, excluded=0):
+        by_status = {WINDOW_IN: 0, WINDOW_OVERDUE: 0, WINDOW_UNDATED: 0}
+        for t in tasks:
+            st = t.get("window_status")
+            if st in by_status:
+                by_status[st] += 1
         payload = {
             "source": "real",
             "as_of": as_of,
             "data_window": {"start": start, "end": end},
+            # 明确写出窗口已生效。此前 `data_window` 只是回显，
+            # 从响应上分辨不出「筛过」和「没筛」—— 这是那次缺陷能藏住的原因。
+            "window_applied": True,
             "tasks": tasks,
             "task_count": len(tasks),
+            # 三类分列。`in_window` 之外的两类不可被引擎排进未来时段：
+            # `overdue` 已经过期，`undated` 没有时间依据。
+            "window_counts": {
+                "in_window": by_status[WINDOW_IN],
+                "overdue": by_status[WINDOW_OVERDUE],
+                "undated": by_status[WINDOW_UNDATED],
+                "excluded_out_of_window": excluded,
+            },
         }
         if notes:
             # 结构性异常不吞掉，但也不升级成错误：数据能读，只是有可疑之处。
