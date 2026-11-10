@@ -189,6 +189,57 @@ def t3_window_in_the_past():
         c.p.kill()
 
 
+def t4_recurring_target_not_floored():
+    """周期任务有 duration_target 时，块长必须等于 target，**不 floor 到最小块**。
+
+    M2 2026-11-10T03:07 用跨实现比对实测出来的那一处：target=600s、min_block=30，
+    旧实现给 30 分钟块，他的 Dart 引擎给 10 分钟 + `task_target`。
+    契约 `39f7f965` L288–293 写死 `duration_target_seconds` 优先，
+    `max(minimum_block_minutes, 30)` 只是两者都没有时的兜底。
+    """
+    print("T4 周期任务时长：有 target 不 floor，无 target 才走兜底")
+    prefs = {"day_start_minute": 480, "day_end_minute": 1320,
+             "minimum_block_minutes": 30}
+
+    def run(tasks):
+        return ts.schedule({"range": [DAY1, DAY1], "tasks": tasks, "courses": [],
+                            "external_fixed_events": [], "overrides": [],
+                            "base_version": "x", "snapshot_ref": None}, prefs)[0]
+
+    with_target = run([{"task_id": "t_tgt", "kind": "long_term", "status": "active",
+                        "duration_target_seconds": 600, "name": "十分钟周期",
+                        "recurrence": {"preset": "daily", "weekdays": [1, 2, 3, 4, 5]}}])
+    check("T4.1 有 target 的周期任务块长 = target（600s）",
+          bool(with_target) and with_target[0]["duration_seconds"] == 600,
+          "dur=%s" % (with_target[0]["duration_seconds"] if with_target else None))
+    check("T4.2 时长来源标 task_target",
+          bool(with_target) and with_target[0]["duration_source"] == "task_target",
+          "source=%s" % (with_target[0]["duration_source"] if with_target else None))
+
+    no_target = run([{"task_id": "t_est", "kind": "long_term", "status": "active",
+                      "duration_target_seconds": None, "name": "无目标周期",
+                      "recurrence": {"preset": "daily", "weekdays": [1, 2, 3, 4, 5]}}])
+    check("T4.3 无 target 走兜底 max(min_block, 30) = 1800s",
+          bool(no_target) and no_target[0]["duration_seconds"] == 1800,
+          "dur=%s" % (no_target[0]["duration_seconds"] if no_target else None))
+    check("T4.4 兜底标记 scheduler_estimate",
+          bool(no_target) and no_target[0]["duration_source"] == "scheduler_estimate",
+          "source=%s" % (no_target[0]["duration_source"] if no_target else None))
+
+    # 用户把最小块设得比 30 还小时，兜底仍应是 30 —— 契约写的是「两者取大」。
+    small = ts.schedule({"range": [DAY1, DAY1], "tasks": [
+        {"task_id": "t_small", "kind": "long_term", "status": "active",
+         "duration_target_seconds": None, "name": "小最小块",
+         "recurrence": {"preset": "daily", "weekdays": [1, 2, 3, 4, 5]}}],
+        "courses": [], "external_fixed_events": [], "overrides": [],
+        "base_version": "x", "snapshot_ref": None},
+        {"day_start_minute": 480, "day_end_minute": 1320,
+         "minimum_block_minutes": 10})[0]
+    check("T4.5 min_block=10 时兜底仍是 30 分钟（两者取大）",
+          bool(small) and small[0]["duration_seconds"] == 1800,
+          "dur=%s" % (small[0]["duration_seconds"] if small else None))
+
+
 def main():
     print("=" * 72)
     print("P1 回归：提案块间重叠（mock vs c9dda83）")
@@ -196,6 +247,7 @@ def main():
     t1_normal_generation()
     t2_injected_overlap_must_be_rejected()
     t3_window_in_the_past()
+    t4_recurring_target_not_floored()
     print("-" * 72)
     if failures:
         print("结论：%d 项未通过 -> %s" % (len(failures), failures))

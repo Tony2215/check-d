@@ -593,8 +593,19 @@ def schedule(payload, prefs):
 
     for t in recurring:
         target = t.get("duration_target_seconds")
-        need = int(target) if target else min_block * 60
-        minutes = max(int((need + 59) // 60), min_block)
+        if target:
+            # 契约 `39f7f965` L288–293：有 `duration_target_seconds` 就用它，**不 floor 到 min_block**。
+            # M2 2026-11-10T03:07 用跨实现比对实测出这一处：target=600s、min_block=30 时
+            # 旧实现给 30 分钟块，他的 Dart 引擎给 10 分钟 + task_target。
+            # 他在撤回 D3 时写明「是镜像按 min_block 把周期任务 floor 了，引擎按 target 合规」。
+            # 我上一轮只看到一次性分支没 floor、周期分支 floor，以为要等口径；
+            # 其实契约已经写死 target 优先，所以这不是变更行为，是修一处违规。
+            minutes = max(int((int(target) + 59) // 60), 1)
+        else:
+            # 没有目标时长才走兜底：`max(minimum_block_minutes, 30)` 分钟。
+            # 注意是两者取大，不是直接用 min_block —— 用户把最小块设成 10 分钟时，
+            # 兜底仍应至少 30 分钟（契约原文的写法）。
+            minutes = max(min_block, 30)
         for d in iter_dates(start, end):
             if is_completed_on(t, d):
                 # 当天 occurrence 已完成：不排块、不进 unplanned、不参与时长兜底，
