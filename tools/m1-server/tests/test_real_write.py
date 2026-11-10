@@ -171,9 +171,28 @@ class TestOptimisticLock(unittest.TestCase):
         self.assertIn("%28", url, "左括号应被百分号编码")
         self.assertIn("%22", url, "值还应被双引号包裹（PostgREST 层的要求）")
 
-    def test_quote_wraps_and_escapes(self):
-        """`_q` 两层处理：先双引号包裹并转义，再百分号编码。"""
-        self.assertEqual(rw._q("abc"), "%22abc%22")
+    def test_quote_only_when_needed(self):
+        """`_q` 只做百分号编码；仅当值含 PostgREST 保留字符时才加双引号。
+
+        **这条断言是被真实 PostgREST 打回来的**（2026-11-10 21:17）：
+        原来无条件加引号，`name=eq.%22CheckD-…%22` 解回 '"CheckD-写入测试-A"'，
+        引号成了值的一部分，与库里的 'CheckD-写入测试-A' 不等 → 匹配 0 行
+        → 真实改名失败（trace 9202678e3a3348fc，SNAPSHOT_CONFLICT）。
+        所以「无条件包裹」这个设计假设是错的，测试当时把它固化成了「正确」。
+
+        保留的部分：值含 , . ( ) : " 时，引号仍是必要的（M3 20:26 的指正成立）。
+        """
+        # 普通值（含中文）：只编码，不包引号 —— 这样才与库里的值相等
+        self.assertEqual(rw._q("abc"), "abc")
+        self.assertEqual(rw._q("CheckD-写入测试-A"),
+                         "CheckD-%E5%86%99%E5%85%A5%E6%B5%8B%E8%AF%95-A")
+        self.assertNotIn("%22", rw._q("CheckD-写入测试-A"))
+
+        # 含保留字符：必须包引号，否则逗号会被当条件分隔符
+        self.assertTrue(rw._q("a,b").startswith("%22"))
+        for ch in ",.():":
+            self.assertIn("%22", rw._q("x%sy" % ch), "含 %r 时应包引号" % ch)
+
         # 值内的双引号要转义成 \" 再编码
         self.assertEqual(rw._q('a"b'), "%22a%5C%22b%22")
         # 反斜杠先转义成 \\

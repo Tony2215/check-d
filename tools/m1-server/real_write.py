@@ -68,8 +68,17 @@ def _q(value):
     在此之前，现场使用的任务名请避开这六个字符。
     """
     s = str(value)
-    quoted = '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
-    return urllib.parse.quote(quoted, safe="")
+    # 2026-11-10 21:17 实测订正：**不能无条件加双引号**。
+    # 对真实 PostgREST 发过一次 PATCH，name=eq.%22CheckD-…%22 解回的是
+    # '"CheckD-写入测试-A"'（引号是值的一部分），与库里的 'CheckD-写入测试-A'
+    # 不相等 → 匹配 0 行 → SNAPSHOT_CONFLICT。去掉引号后形状才对。
+    #
+    # 但引号在含保留字符时仍是必要的（M3 20:26 的指正成立）：值里出现
+    # , . ( ) : " 时，PostgREST 会把它们当语法。所以改成**按需加**：
+    # 只有当值里真的有这些字符，才包引号并转义。
+    if any(ch in s for ch in ',.():\\"'):
+        s = '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
+    return urllib.parse.quote(s, safe="")
 
 
 def patch_transport(url, headers, timeout, body):
