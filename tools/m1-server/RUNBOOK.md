@@ -384,9 +384,9 @@ python -m unittest discover -s tools/m1-server/tests
 | `test_real_path_http.py` | 23 | 反向隔离（含「两个口令同时带」）、工具面、失败不回落、窗口、现网回归 |
 | `test_real_end_to_end.py` | 10 | 假 PostgREST 端到端：JWT 透传、信封形状、`data.tasks`、软删除过滤的适用范围 |
 | `test_real_token_update.py` | 9 | 令牌注入入口：鉴权、形状校验、不回显 |
-| `test_real_schema_columns.py` | 5 | **静态核对**：用到的每一列都真在 migration 里存在（不连网） |
+| `test_real_schema_columns.py` | 7 | **静态核对**：用到的每一列都真在 migration 里存在；端到端夹具的每个键也是真实列名（不连网） |
 
-合计 **80 项**（REAL 五份）。整套（含 MOCK 与快照库）**277 项**。
+合计 **82 项**（REAL 五份）。整套（含 MOCK 与快照库）**279 项**。
 
 ### 列名必须对 migration 做静态核验（2026-11-09 实测踩到）
 

@@ -23,6 +23,9 @@ import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, ".."))
+# 同目录下要导入 test_real_end_to_end 的夹具；两种跑法（`discover -s tests` 与
+# `python -m unittest tests.xxx`）下 top_level 不同，所以把 tests 目录本身也放进路径。
+sys.path.insert(0, HERE)
 
 import real_read as rr  # noqa: E402
 
@@ -153,6 +156,54 @@ class SchemaColumnsExist(unittest.TestCase):
         哪天表结构真加了这一列，这个测试会红，提醒把过滤加回来。
         """
         self.assertNotIn("deleted_at", self.schema.get("task_schedules", set()))
+
+
+class FixturesUseRealColumnNames(unittest.TestCase):
+    """端到端测试用的构造行，必须只用**真实列名**。
+
+    M0 2026-11-10 要求「至少完成真实结构 fixtures 的端到端无凭证测试」。
+    「真实结构」不能靠我口头保证——这份测试把它变成可核的：
+    逐字段断言 fixture 的每个键都在 migration 里存在。
+
+    注意区分两件事：
+    - 本测试证明 **fixture 的字段名与真实 schema 一致**；
+    - 它**不证明** fixture 的行内容是真实数据。行内容是手写构造的，
+      真实读取仍然只能由 M0 配短期授权后单独验证。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        if not glob.glob(MIGRATION_GLOB):
+            raise unittest.SkipTest("仓库里没有 supabase/migrations，跳过。")
+        cls.schema = load_table_columns()
+
+    def test_every_fixture_field_is_a_real_column(self):
+        import test_real_end_to_end as e2e
+
+        checked = 0
+        for table, rows in e2e._ROUTE.items():
+            have = self.schema.get(table, set())
+            self.assertTrue(have, "表 %s 不在 migration 里" % table)
+            for row in rows:
+                for key in row:
+                    checked += 1
+                    with self.subTest(table=table, field=key):
+                        self.assertIn(
+                            key, have,
+                            "fixture 字段 %s.%s 不是真实列名（真实库会 400）"
+                            % (table, key),
+                        )
+        # 夹具被清空时不要让这个测试变成空转
+        self.assertGreater(checked, 40, "只核了 %d 个字段，夹具可能被清空了" % checked)
+
+    def test_fixtures_cover_the_tables_this_layer_reads(self):
+        """夹具必须覆盖本层真正读的七张表，否则端到端测的是半条链路。"""
+        import test_real_end_to_end as e2e
+
+        self.assertEqual(
+            set(e2e._ROUTE), set(QUERIED),
+            "夹具覆盖的表与本层实际查询的表不一致",
+        )
 
 
 if __name__ == "__main__":
