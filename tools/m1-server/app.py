@@ -317,6 +317,18 @@ def _now():
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
+# 进程启动时刻：用来判断「令牌是在本进程里丢的，还是进程换了一个」。
+_BOOT_TS = time.time()
+_BOOT_AT = _now()
+
+
+def _iso_from_epoch(epoch):
+    try:
+        return datetime.fromtimestamp(int(epoch), timezone.utc).isoformat()
+    except Exception:                                        # noqa: BLE001
+        return None
+
+
 def _fp(secret):
     """口令指纹：只用于核对"环境变量是不是这份值"，不可逆，不泄露明文。"""
     if not secret:
@@ -336,6 +348,7 @@ def _env_diag():
     import socket
     import subprocess
     import tempfile
+    import urllib.parse
 
     diag = {
         "os": {"platform": sys.platform, "release": platform.release(),
@@ -405,9 +418,25 @@ def _env_diag():
     # 串行时 6 个目标 × 4s 超时 ≈ 24s，加引擎探测实测 /diag 要 31s——
     # 多数客户端默认 30s 超时，等于诊断端点自己先超时，失去意义。
     egress = {}
-    targets = (("1.1.1.1", 443), ("pypi.org", 443),
+    targets = [("1.1.1.1", 443), ("pypi.org", 443),
                ("pub.dev", 443), ("storage.googleapis.com", 443),
-               ("raw.githubusercontent.com", 443), ("github.com", 443))
+               ("raw.githubusercontent.com", 443), ("github.com", 443)]
+
+    # 2026-11-10 M0 报 REAL 调用 URLError / HTTP 0 后加的：把真实数据源主机也探一遍。
+    # 目的不是「构建依赖」，是回答一个具体问题——**容器到底出不出得去那个域名**。
+    # 不探这一项时，只能看到「无法连接数据源」，分不清是地址写错、DNS 挂了还是出口被拦。
+    _real_host = ""
+    try:
+        _real_host = (urllib.parse.urlparse(REAL_SUPABASE_URL or "").hostname or "")
+    except Exception:                                        # noqa: BLE001
+        _real_host = ""
+    if _real_host:
+        targets.append((_real_host, 443))
+        # DNS 单独记一条：解析失败与连不上是两种完全不同的故障。
+        try:
+            egress["dns:" + _real_host] = socket.gethostbyname(_real_host)
+        except Exception as e:                               # noqa: BLE001
+            egress["dns:" + _real_host] = type(e).__name__
 
     def _probe(host, port):
         key = "%s:%d" % (host, port)
@@ -439,6 +468,31 @@ def _env_diag():
                               if k.startswith("CHECKD_") or k in ("BIND", "PORT", "PATH"))
     # 6) M2 引擎存活状态（只走回环）。
     diag["engine"] = _engine_status()
+
+    # 7) 运行态：进程何时起来、注入的令牌还在不在。
+    # 2026-11-10 M0 报「注入成功但随后读不到」后加的：没有这一项，
+    # 「令牌没到达」「令牌到了但进程被重启掉了」「打到了另一个实例」三种情况
+    # 从外部看完全一样，只能靠猜。这里只报**在不在、什么时候设的、什么时候到期**，
+    # 不报值、不报长度、不报指纹。
+    _jwt = _REAL_JWT_OVERRIDE.get("value") or REAL_JWT or ""
+    _exp = None
+    if _jwt:
+        try:
+            _ok, _info = _looks_like_jwt(_jwt)
+            _exp = _info.get("exp") if _ok else None
+        except Exception:                                    # noqa: BLE001
+            _exp = None
+    diag["runtime"] = {
+        "pid": os.getpid(),
+        "boot_at": _BOOT_AT,
+        "uptime_seconds": int(time.time() - _BOOT_TS),
+        "real_jwt_present": bool(_jwt),
+        "real_jwt_source": ("override" if _REAL_JWT_OVERRIDE.get("value")
+                            else ("env" if REAL_JWT else None)),
+        "real_jwt_set_at": _REAL_JWT_OVERRIDE.get("set_at"),
+        "real_jwt_exp": (_iso_from_epoch(_exp) if _exp else None),
+        "real_jwt_expired": bool(_exp and _exp < int(time.time())),
+    }
     # 快照库：mode=on 时才真去连（这里被低频访问，连一次可以接受）。
     diag["snapshot"] = _snapshot_state()
     # explanations 过滤统计：被剔除多少条、有没有未登记的码。

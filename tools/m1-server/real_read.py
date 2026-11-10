@@ -58,6 +58,7 @@ M0 2026-11-09T10:51 要求「本阶段必须清晰区分 REAL-READ / MOCK-SCHEDU
 """
 
 import json
+import re
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -150,6 +151,19 @@ class RealReadError(Exception):
 # 传输层（可注入，便于在没有任何真实凭证的情况下跑测试）
 # --------------------------------------------------------------------------
 
+_BEARER_RE = re.compile(r"(Bearer\s+)[A-Za-z0-9._\-]+", re.I)
+
+
+def _scrub(value, limit=200):
+    """把异常文本压成一句可上报的原因，并擦掉任何 Bearer 令牌。
+
+    上报出去的东西会被贴进邮件和群聊，所以宁短勿全、宁擦勿露。
+    """
+    text = str(value)
+    text = _BEARER_RE.sub(r"\1<redacted>", text)
+    return text[:limit]
+
+
 def urllib_transport(url, headers, timeout):
     """默认传输：返回 (http_status, body_bytes)。
 
@@ -162,10 +176,16 @@ def urllib_transport(url, headers, timeout):
     except urllib.error.HTTPError as exc:
         return exc.code, exc.read()
     except Exception as exc:                       # 连接失败/超时/DNS
+        # 2026-11-10 M0 报「URLError / HTTP 0」后补：只报异常类名不够用——
+        # `URLError` 背后可能是 DNS 解析失败、出口被拦、TLS 握手失败，处置完全不同。
+        # 这里带上一句底层原因（截断），**不含令牌**：令牌在请求头里，不进异常文本，
+        # 仍然做一次 Bearer 擦除兜底。
         raise RealReadError(
             "DEPENDENCY_UNAVAILABLE",
             "无法连接数据源。",
-            [{"field": "transport", "reason": type(exc).__name__}],
+            [{"field": "transport",
+              "reason": type(exc).__name__,
+              "detail": _scrub(getattr(exc, "reason", exc))}],
         )
 
 
