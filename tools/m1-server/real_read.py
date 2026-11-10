@@ -95,6 +95,14 @@ COURSE_RULE_COLUMNS = ("id", "course_id", "weekday", "week_rule_type",
 OVERRIDE_COLUMNS = ("id", "item_type", "item_id", "local_date", "action",
                     "planned_start_minute", "planned_end_minute")
 
+# 学期锚点（migration `202609100001` stage_14 L49）。
+# M0 2026-11-10T02:04 亲自在 App「编辑学期」页核到：大二上学期 / 首周 2026-08-31 /
+# 总周数 18 / 已设为当前学期。所以**这不是缺失设计**，读不到只能是读取链路没闭合。
+# 他的要求：不可写死 2026-08-31、不可凭当前星期猜、不可新建重复学期表；
+# 云端缺记录或当前学期无法确定时 fail-closed，blocked 上报。
+SEMESTER_COLUMNS = ("id", "name", "first_week_start_date", "total_weeks",
+                    "schedule_template_id", "is_current", "updated_at")
+
 
 # --------------------------------------------------------------------------
 # 枚举转换
@@ -421,6 +429,10 @@ class RealRead:
         # 早先的顺序是先查 courses、空了就直接 return，会把这类例外整片丢掉。
         overrides = self._read_overrides(start, end)
 
+        # 学期锚点：M2 的周次展开要它，M0 2026-11-10T02:04 明确「由 M1 读取层送进去」。
+        # 读不到不阻断整次调用（tasks 那部分仍然有效），但必须上报，不许静默给空数组。
+        semesters, semester_blocked = self._read_semesters()
+
         course_rows = self.reader.select(
             "courses", COURSE_COLUMNS,
             filters=["deleted_at=is.null"], order="updated_at.desc")
@@ -441,7 +453,60 @@ class RealRead:
                     "updated_at": _iso(row.get("updated_at")),
                     "rules": [self._shape_rule(r) for r in rules.get(row["id"], [])],
                 })
-        return self._events_payload(courses, [], overrides, start, end, as_of)
+        return self._events_payload(courses, [], overrides, start, end, as_of,
+                                    semesters, semester_blocked)
+
+    def _read_semesters(self):
+        """读学期表并判定「当前学期锚点是否唯一且明确」。
+
+        返回 `(semesters, blocked)`：
+        - `semesters` 照原样给全（调用方可能要看全部学期，不只当前那个）
+        - `blocked` 是 fail-closed 的上报出口，空数组表示锚点明确
+
+        三种 blocked 情形（M2 2026-11-10T02:08 已在他的模块里定同样的码，两边一致）：
+        没有学期记录 / 有记录但没有一条标记为当前 / 同时多条当前。
+
+        **不猜**：不做「取 updated_at 最新的那条」这种兜底。猜错的后果是整学期课表错位。
+        """
+        rows = self.reader.select(
+            "semesters", SEMESTER_COLUMNS,
+            filters=["deleted_at=is.null"], order="updated_at.desc")
+
+        out = []
+        for r in rows:
+            out.append({
+                "semester_id": r["id"],
+                "name": r.get("name"),
+                "first_week_start_date": _date(r.get("first_week_start_date")),
+                "total_weeks": r.get("total_weeks"),
+                "schedule_template_id": r.get("schedule_template_id"),
+                "is_current": bool(r.get("is_current")),
+                "updated_at": _iso(r.get("updated_at")),
+            })
+
+        blocked = []
+        current = [s for s in out if s["is_current"]]
+        if not out:
+            blocked.append({
+                "code": "MISSING_SEMESTER_ANCHOR",
+                "message": "云端没有学期记录（semesters 为空），无法确定学期首周。",
+                "basis": {"table": "semesters", "rows": 0},
+            })
+        elif not current:
+            blocked.append({
+                "code": "MISSING_SEMESTER_ANCHOR",
+                "message": "有 %d 条学期记录，但没有一条标记为当前学期。" % len(out),
+                "basis": {"table": "semesters", "rows": len(out), "current_rows": 0},
+            })
+        elif len(current) > 1:
+            blocked.append({
+                "code": "MULTIPLE_CURRENT_SEMESTERS",
+                "message": "同时有 %d 条当前学期，拒绝猜测取哪一条。" % len(current),
+                "basis": {"table": "semesters", "rows": len(out),
+                          "current_rows": len(current),
+                          "current_ids": [s["semester_id"] for s in current]},
+            })
+        return out, blocked
 
     def _read_overrides(self, start, end):
         """读单日例外。**按查询窗口过滤**，不把整张历史拉下来。
@@ -485,11 +550,17 @@ class RealRead:
             "end_minute": r.get("ends_at_minute"),
         }
 
-    def _events_payload(self, courses, events, overrides, start, end, as_of):
+    def _events_payload(self, courses, events, overrides, start, end, as_of,
+                        semesters=None, semester_blocked=None):
         return {
             "source": "real",
             "as_of": as_of,
             "data_window": {"start": start, "end": end},
+            # 学期锚点：M2 的 expand_course_rules 用第一周的日期把「第几周」落到具体日历日。
+            # M0 2026-11-10T02:04 的原话是「由 M1 读取层把相应学期首周日期送到 M2」。
+            # 这里给全量学期列表 + 明确的 blocked 出口，不替他挑。
+            "semesters": semesters or [],
+            "semester_blocked": semester_blocked or [],
             "courses": courses,
             # `events` 是「已展开成具体日期时段」的结果。本模块**不展开**，
             # 因此这里恒为空数组，而不是拿规则凑一个出来。

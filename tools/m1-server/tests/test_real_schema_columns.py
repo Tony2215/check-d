@@ -98,6 +98,7 @@ QUERIED = {
     "courses": (rr.COURSE_COLUMNS, ("deleted_at",)),
     "course_schedule_rules": (rr.COURSE_RULE_COLUMNS, ("deleted_at",)),
     "daily_item_overrides": (rr.OVERRIDE_COLUMNS, ("deleted_at",)),
+    "semesters": (rr.SEMESTER_COLUMNS, ("deleted_at",)),
 }
 
 

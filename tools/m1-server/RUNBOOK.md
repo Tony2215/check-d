@@ -357,6 +357,28 @@ curl -X POST https://checkd-agent-tools.app.workbuddy.host/admin/real-token \
 - 入口会拒掉：非 JWT 形状、载荷无 `exp`、已过期。收下这些只会让后续 401 被误判成配置错。
 - 响应只回过期时刻，**不回显令牌本体或任何一段**。
 
+### 学期锚点（M0 2026-11-10T02:04 派工后新增）
+
+M0 在 App「编辑学期」页亲自核到：大二上学期 / 首周 **2026-08-31** / 18 周 / 已设为当前学期。
+所以「学期缺失」不成立，读不到只能是读取链路没闭合。他的硬要求：
+**不可写死 2026-08-31、不可凭当前星期猜、不可新建重复学期表**，缺记录或不明确就 fail-closed 上报。
+
+`get_calendar_events` 的输出因此多两个字段：
+
+| 字段 | 内容 |
+|---|---|
+| `semesters[]` | 全量学期：`semester_id` / `name` / `first_week_start_date` / `total_weeks` / `schedule_template_id` / `is_current` / `updated_at`。**原样透传**，不推算、不补时间 |
+| `semester_blocked[]` | fail-closed 上报出口，空数组表示锚点明确 |
+
+三种 blocked（码名与 M2 模块一致）：
+
+1. `semesters` 一条都没有 → `MISSING_SEMESTER_ANCHOR`
+2. 有记录但没有一条 `is_current` → `MISSING_SEMESTER_ANCHOR`
+3. 同时多条 `is_current` → `MULTIPLE_CURRENT_SEMESTERS`
+
+**不许猜**：不做「取 `updated_at` 最新那条顶上」这种兜底。猜错的后果是整学期课表错位，
+比明确报错更糟。缺锚点**不阻断**整次调用（任务部分仍然有效），但必须在 `semester_blocked` 里出现。
+
 ### 已知边界（不得写成已实现）
 
 1. **课程周次展开不在这里**。`get_calendar_events` 的 `events` 恒为空数组并带
@@ -393,13 +415,13 @@ python tools/m1-server/verify_real_isolated.py
 
 | 文件 | 项数 | 钉住什么 |
 |---|---|---|
-| `test_real_read.py` | 33 | 字段映射、白名单、错误码、空集不回落、不传 user_id |
+| `test_real_read.py` | 38 | 字段映射、白名单、错误码、空集不回落、不传 user_id、学期锚点不猜 |
 | `test_real_path_http.py` | 23 | 反向隔离（含「两个口令同时带」）、工具面、失败不回落、窗口、现网回归 |
 | `test_real_end_to_end.py` | 10 | 假 PostgREST 端到端：JWT 透传、信封形状、`data.tasks`、软删除过滤的适用范围 |
 | `test_real_token_update.py` | 9 | 令牌注入入口：鉴权、形状校验、不回显 |
 | `test_real_schema_columns.py` | 7 | **静态核对**：用到的每一列都真在 migration 里存在；端到端夹具的每个键也是真实列名（不连网） |
 
-合计 **82 项**（REAL 五份）。整套（含 MOCK 与快照库）**279 项**。
+合计 **87 项**（REAL 五份）。整套（含 MOCK 与快照库）**284 项**。
 
 ### 列名必须对 migration 做静态核验（2026-11-09 实测踩到）
 

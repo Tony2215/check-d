@@ -433,5 +433,72 @@ class TestDailyOverrides(unittest.TestCase):
             self.assertNotIn(col, url, "单日例外查询里出现了非白名单列 %s" % col)
 
 
+class TestSemesterAnchor(unittest.TestCase):
+    """学期锚点：M2 的周次展开要「第一周是哪天」，由本层读出来送进去。
+
+    M0 2026-11-10T02:04 的原话：学期首周日期在 App 里本来就有（大二上学期 /
+    2026-08-31 / 18 周 / 已设为当前学期），所以「缺失」只能是读取链路没闭合。
+    他的硬要求：不可写死、不可凭当前星期猜、缺记录或当前学期不确定时必须 fail-closed 上报。
+
+    这三条测试就是「不许猜」的可执行版本。
+    """
+
+    SEM_OK = {"id": "uuid-s1", "name": "大二上学期",
+              "first_week_start_date": "2026-08-31", "total_weeks": 18,
+              "schedule_template_id": "uuid-tpl", "is_current": True,
+              "updated_at": "2026-11-09T06:00:00+08:00"}
+
+    def _cal(self, semesters):
+        r, _ = reader({"courses": (200, []), "semesters": (200, semesters)})
+        return rr.RealRead(r).get_calendar_events("2026-11-09", "2026-11-15")
+
+    def test_current_semester_anchor_is_passed_through_verbatim(self):
+        out = self._cal([self.SEM_OK])
+        self.assertEqual(out["semester_blocked"], [])
+        self.assertEqual(len(out["semesters"]), 1)
+        sem = out["semesters"][0]
+        # 原样透传：不补时间、不按当前日期推算、不换成「第几周」
+        self.assertEqual(sem["first_week_start_date"], "2026-08-31")
+        self.assertEqual(sem["total_weeks"], 18)
+        self.assertTrue(sem["is_current"])
+        self.assertEqual(sem["semester_id"], "uuid-s1")
+
+    def test_no_semester_row_is_reported_not_guessed(self):
+        out = self._cal([])
+        self.assertEqual(out["semesters"], [])
+        codes = [b["code"] for b in out["semester_blocked"]]
+        self.assertEqual(codes, ["MISSING_SEMESTER_ANCHOR"])
+        self.assertEqual(out["semester_blocked"][0]["basis"]["rows"], 0)
+
+    def test_rows_but_no_current_is_reported(self):
+        """有学期记录但没标当前：**不许**拿 updated_at 最新的那条顶上。
+
+        猜错的后果是整学期课表错位，比不给更糟。
+        """
+        older = dict(self.SEM_OK, id="uuid-s2", is_current=False)
+        newer = dict(self.SEM_OK, id="uuid-s1", is_current=False)
+        out = self._cal([newer, older])
+        self.assertEqual(len(out["semesters"]), 2, "全部学期都应该原样给出")
+        self.assertEqual([b["code"] for b in out["semester_blocked"]],
+                         ["MISSING_SEMESTER_ANCHOR"])
+        self.assertEqual(out["semester_blocked"][0]["basis"]["current_rows"], 0)
+
+    def test_multiple_current_is_reported(self):
+        a = dict(self.SEM_OK, id="uuid-sa")
+        b = dict(self.SEM_OK, id="uuid-sb")
+        out = self._cal([a, b])
+        self.assertEqual([x["code"] for x in out["semester_blocked"]],
+                         ["MULTIPLE_CURRENT_SEMESTERS"])
+        self.assertEqual(out["semester_blocked"][0]["basis"]["current_rows"], 2)
+
+    def test_semester_query_uses_only_whitelisted_columns(self):
+        r, t = reader({"courses": (200, []), "semesters": (200, [self.SEM_OK])})
+        rr.RealRead(r).get_calendar_events("2026-11-09", "2026-11-15")
+        url = t.table_url("semesters")
+        self.assertIn("deleted_at=is.null", url)
+        for col in ("notes", "user_id"):
+            self.assertNotIn(col, url, "学期查询里出现了非白名单列 %s" % col)
+
+
 if __name__ == "__main__":
     unittest.main()

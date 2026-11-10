@@ -91,6 +91,16 @@ FIXTURE_RULES = [
      "starts_at_minute": 480, "ends_at_minute": 580},
 ]
 
+# 学期锚点。M0 2026-11-10T02:04 在 App「编辑学期」页核到的真实值是
+# 大二上学期 / 首周 2026-08-31 / 18 周 / 当前学期 —— 但这里是**构造行**，
+# 用的是真实列名，不是他的真实记录。
+FIXTURE_SEMESTERS = [
+    {"id": "fixture-semester-1", "name": "大二上学期",
+     "first_week_start_date": "2026-08-31", "total_weeks": 18,
+     "schedule_template_id": "fixture-template-1", "is_current": True,
+     "updated_at": "2026-11-09T06:00:00+08:00"},
+]
+
 _ROUTE = {
     "tasks": FIXTURE_TASKS,
     "one_time_reminders": FIXTURE_REMINDERS,
@@ -99,6 +109,7 @@ _ROUTE = {
     "courses": FIXTURE_COURSES,
     "course_schedule_rules": FIXTURE_RULES,
     "daily_item_overrides": FIXTURE_OVERRIDES,
+    "semesters": FIXTURE_SEMESTERS,
 }
 
 
@@ -289,7 +300,7 @@ class TestEndToEndRead(unittest.TestCase):
         self.stack.call("list_tasks")
         self.stack.call("get_calendar_events")
         tables_with_soft_delete = {"tasks", "courses", "course_schedule_rules",
-                                   "daily_item_overrides"}
+                                   "daily_item_overrides", "semesters"}
         seen = {r["table"]: r["query"] for r in _FakePostgrest.received}
         for t, q in seen.items():
             if t in tables_with_soft_delete:
