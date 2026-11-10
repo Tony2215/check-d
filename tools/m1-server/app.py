@@ -70,7 +70,63 @@ except Exception as _exc:                       # pragma: no cover
 SERVICE_NAME = "checkd-agent-tools"
 SERVICE_VERSION = "1.0.0"
 
-DEMO_TOKEN = os.environ.get("CHECKD_DEMO_TOKEN", "")
+# --------------------------------------------------------------------------
+# 凭证读取：环境变量优先，缺失则读**部署目录内的文件**
+# --------------------------------------------------------------------------
+#
+# 为什么必须这么做（2026-11-10 21:0x，为最小 REAL-WRITE 上线而加）：
+#
+#   1. 平台发布工具只接受 `startCmd` 一个字段注入环境变量，没有 secrets 字段；
+#   2. 写进 `startCmd` 的值会留在平台部署配置里（M0 2026-11-10 明确反对）；
+#   3. 最硬的一条：**拼 `startCmd` 的人在终端里读到的凭证值可能已被脱敏/替换**，
+#      照抄过去就是错值，一次发布让全站 401——这比前面两条都致命。
+#
+# 所以让进程自己读文件，`startCmd` 里一个口令都不出现。
+# 这样即使有人用错值拼了 startCmd，只要部署目录里的文件还在，服务照样起得来。
+#
+# 反过来也留了兼容：环境变量比文件优先，原来的部署方式继续有效。
+#
+# 文件名沿用 2026-11-08 部署时就在目录里的那几个；同一份值放过两个名字的，
+# 新名字（conf_*）优先，旧名字兜底。
+_ENV_FILE_MAP = {
+    "CHECKD_DEMO_TOKEN": ("conf_demo.txt", ".token"),
+    "CHECKD_ADMIN_KEY": ("conf_admin.txt", ".admin"),
+    "CHECKD_REAL_TOKEN": ("conf_rtoken.txt", ".rtoken"),
+    "CHECKD_REAL_SUPABASE_URL": (".surl",),
+    "CHECKD_REAL_ANON_KEY": (".sanon",),
+}
+_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def _read_cred_file(names):
+    """按顺序找第一个存在的文件，返回去空白后的内容；都没有则返回空串。
+
+    **必须按字节读再解码**：Windows 上文本模式写回会把 \n 变成 \r\n，
+    而带 \r 的口令会让字符串比较永久失败（2026-11-08 踩过，全站 401）。
+    这里用 strip() 兜住历史遗留的 \r，但写入侧仍要求 LF。
+    """
+    for name in names:
+        path = os.path.join(_BASE_DIR, name)
+        try:
+            with open(path, "rb") as f:
+                raw = f.read()
+        except OSError:
+            continue
+        value = raw.decode("utf-8", "replace").strip()
+        if value:
+            return value
+    return ""
+
+
+def _env_or_file(name, default=""):
+    """先看环境变量，没有再看文件。"""
+    value = os.environ.get(name, "")
+    if value:
+        return value
+    return _read_cred_file(_ENV_FILE_MAP.get(name, ())) or default
+
+
+DEMO_TOKEN = _env_or_file("CHECKD_DEMO_TOKEN")
 
 # 方案 A（2026-11-08，M0 15:55 询问后定）：允许只配置**口令的指纹**，不配置明文。
 #
@@ -110,7 +166,7 @@ def _parse_sha256_list(raw):
 
 DEMO_TOKEN_SHA256 = _parse_sha256_list(os.environ.get("CHECKD_DEMO_TOKEN_SHA256", ""))
 
-ADMIN_KEY = os.environ.get("CHECKD_ADMIN_KEY", "")
+ADMIN_KEY = _env_or_file("CHECKD_ADMIN_KEY")
 # 口令通过后固定使用的演示身份；不对外暴露 mock 内部 token
 DEMO_USER_TOKEN = os.environ.get("CHECKD_DEMO_USER", "demo-token-alice")
 
@@ -186,10 +242,10 @@ REAL_ENABLED = os.environ.get("CHECKD_REAL_ENABLED", "0") == "1"
 # REAL 路径的独立口令。**故意不复用 CHECKD_DEMO_TOKEN**：
 # 那个口令 2026-11-08 已经写进邮件、进过交付件、在多人手里。
 # 若它也能开 REAL，等于「隔离」只存在于命名上。反向隔离是这套设计的地基。
-REAL_TOKEN = os.environ.get("CHECKD_REAL_TOKEN", "")
+REAL_TOKEN = _env_or_file("CHECKD_REAL_TOKEN")
 
-REAL_SUPABASE_URL = os.environ.get("CHECKD_REAL_SUPABASE_URL", "")
-REAL_ANON_KEY = os.environ.get("CHECKD_REAL_ANON_KEY", "")
+REAL_SUPABASE_URL = _env_or_file("CHECKD_REAL_SUPABASE_URL")
+REAL_ANON_KEY = _env_or_file("CHECKD_REAL_ANON_KEY")
 # 用户级短期 access_token（约 1 小时过期）。只从环境变量读，不落盘、不回显。
 # M0 2026-11-09T14:20 决定：不做自动续期，由 M0 演示前手动更新。
 REAL_JWT = os.environ.get("CHECKD_REAL_JWT", "")
@@ -244,6 +300,20 @@ REAL_TOOL_NAMES = ("list_tasks", "get_calendar_events")
 # 后者只要有一处判断写漏就会漏到生产。
 REAL_WRITE_ENABLED = os.environ.get("CHECKD_REAL_WRITE", "0") == "1"
 REAL_WRITE_TOOL = "update_task_name"
+
+
+def _real_allowed_tools():
+    """REAL 侧当前允许的工具名集合。
+
+    存在的理由（2026-11-10 21:0x，本地冒烟抓到）：写入工具加进 `_real_tool_defs()`
+    之后，`/real/tools/<name>` 与 `tools/call` 两处的白名单**没有一起改**，
+    结果是「列表里有 update_task_name，调用却说 REAL 路径不提供该工具」。
+    能力列表与准入判断必须同源，否则加一个工具就要记得改三处，迟早漏。
+    """
+    names = set(REAL_TOOL_NAMES)
+    if REAL_WRITE_ENABLED:
+        names.add(REAL_WRITE_TOOL)
+    return names
 
 
 def _in_real_window(now=None):
@@ -1155,7 +1225,7 @@ def _mcp_handle(msg, real=False):
         name = params.get("name")
         args = params.get("arguments") or {}
         if real:
-            if name not in REAL_TOOL_NAMES:
+            if name not in _real_allowed_tools():
                 # 明确说清是「REAL 侧不提供」，不是「工具不存在」——
                 # 后者会让排查方向跑到注册表上。
                 return _mcp_error(rid, -32602,
@@ -1578,12 +1648,12 @@ class Handler(BaseHTTPRequestHandler):
             if not self._real_ok():
                 return
             name = path[len("/real/tools/"):]
-            if name not in REAL_TOOL_NAMES:
+            if name not in _real_allowed_tools():
                 # 404 + 明确文案：这是「本路径不提供」，不是「工具没实现」。
                 # 两者混淆会让排查跑到工具注册表上，而真实原因只是走了别的路径。
                 self._fail(404, "NOT_FOUND",
                            "REAL 路径不提供该工具：%s（仅 %s）"
-                           % (name, "/".join(REAL_TOOL_NAMES)))
+                           % (name, "/".join(sorted(_real_allowed_tools()))))
                 return
             try:
                 args = self._json_body()

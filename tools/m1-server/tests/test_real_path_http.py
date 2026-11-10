@@ -33,7 +33,7 @@ _RELEVANT_ENV = (
     "CHECKD_DEMO_TOKEN", "CHECKD_DEMO_TOKEN_SHA256", "CHECKD_ADMIN_KEY",
     "CHECKD_HEALTH_MINIMAL", "CHECKD_REAL_ENABLED", "CHECKD_REAL_TOKEN",
     "CHECKD_REAL_SUPABASE_URL", "CHECKD_REAL_ANON_KEY", "CHECKD_REAL_JWT",
-    "CHECKD_REAL_WINDOW",
+    "CHECKD_REAL_WINDOW", "CHECKD_REAL_WRITE",
 )
 
 _OMITTED = object()
@@ -446,6 +446,65 @@ class TestRealWindow(unittest.TestCase):
             if time.localtime().tm_hour == 0 and time.localtime().tm_min == 0:
                 self.skipTest("恰好撞上 00:00，本用例的构造前提不成立")
             self.assertEqual(code, 403)
+        finally:
+            s.stop()
+
+
+class TestRealWriteToolRouting(unittest.TestCase):
+    """写入工具在 REAL 路径上必须「既列出、也能路由到」。
+
+    2026-11-10 21:0x 本地冒烟抓到的缺口：把 update_task_name 加进 tools/list
+    之后，`/real/tools/<name>` 与 `tools/call` 两处白名单没有一起改，
+    表现是「列表里有、一调就说 REAL 路径不提供该工具」。
+    白名单已收敛到 `_real_allowed_tools()` 一个来源，本用例钉住它。
+
+    **这条只能靠真实 HTTP 验**：纯函数测试发现不了「列表由 A 处生成、
+    准入由 B 处判断」这类分叉。
+    """
+
+    TOKEN = "rt-routing-token"
+
+    def _server(self, write_enabled):
+        env = dict(CHECKD_DEMO_TOKEN="demo-tok",
+                   CHECKD_REAL_ENABLED="1",
+                   CHECKD_REAL_TOKEN=self.TOKEN,
+                   CHECKD_REAL_SUPABASE_URL=DEAD_URL,
+                   CHECKD_REAL_ANON_KEY="anon",
+                   CHECKD_REAL_JWT="jwt")
+        if write_enabled:
+            env["CHECKD_REAL_WRITE"] = "1"
+        return _Server(**env)
+
+    def _tool_names(self, srv):
+        code, body = srv.mcp("/real/mcp",
+                             {"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+                             headers={"X-Real-Token": self.TOKEN})
+        self.assertEqual(code, 200)
+        return [t["name"] for t in body["result"]["tools"]]
+
+    def test_listed_and_routable_when_enabled(self):
+        s = self._server(True)
+        try:
+            names = self._tool_names(s)
+            self.assertIn("update_task_name", names, "开关开启时应出现在工具列表")
+            self.assertEqual(len(names), 3, "开启后应为 2 读 + 1 写")
+            code, body = s.real("/real/tools/update_task_name", real_token=self.TOKEN)
+            self.assertNotEqual(code, 404,
+                                "被列出却路由不到，就是列表与准入门不同源")
+            err = (body or {}).get("error") or {}
+            self.assertNotEqual(err.get("code"), "NOT_FOUND")
+        finally:
+            s.stop()
+
+    def test_absent_and_not_routable_when_disabled(self):
+        s = self._server(False)
+        try:
+            names = self._tool_names(s)
+            self.assertNotIn("update_task_name", names, "默认关闭时不应出现")
+            self.assertEqual(len(names), 2)
+            code, body = s.real("/real/tools/update_task_name", real_token=self.TOKEN)
+            self.assertEqual(code, 404)
+            self.assertEqual((body or {}).get("error", {}).get("code"), "NOT_FOUND")
         finally:
             s.stop()
 
