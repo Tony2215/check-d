@@ -1,0 +1,548 @@
+{
+ "_readme": [
+  "【脱敏说明】这是 2026-11-10 19:07(+08) 从真实 Supabase 读出的样本，source=real，不是夹具。",
+  "脱敏：课程名→C01..C12、任务名→T1..T5、学期名→S1、各类 UUID→前 8 位。",
+  "未脱敏可核：全部字段名、全部数值（weekday / start_minute / end_minute / week_rule_type / week_numbers / total_weeks / start_week / end_week）、semester_start、计数、trace_id。",
+  "为什么脱敏：本仓库是公开 fork，真实课程与任务名称属使用者个人数据。需要核对真实名称时找 M1 定向提供。",
+  "",
+  "【用途】给 M2 直接喂 expand_course_rules，替代离线夹具；也给 M3 复核结构与数值。",
+  "semester_start = 2026-08-31，可直接作为 expand_course_rules 的 semester_start 参数。",
+  "rules 是扁平数组，带 course_id + course_name，便于直接 join。",
+  "events 为空是分工：读取层不做周次展开，展开归 M2 引擎（见 events_unavailable_reason）。",
+  "",
+  "【必须先决定的四处数据冲突——读取层如实读出，不替你选】",
+  "冲突1（最严重）：C02 有一条 weekday=5 的规则，start_week=2 且 end_week=2，但 week_numbers 列了 15 周。",
+  "  按起止周解释 → 只出第 2 周（1 次）；按 week_numbers 解释 → 15 周。两者差 14 周。",
+  "冲突2：C02 另一条 weekday=2，start_week=3、end_week=18，但 week_numbers 从 4 开始。第 3 周到底有没有课，两字段打架。",
+  "冲突3：C05 有两条 every_week，一条 start_week=null/end_week=1，一条 start_week=2/end_week=null。边界语义未定。",
+  "冲突4：全部 21 条里有 18 条 start_week 为 null；week_numbers 乱序（15 排在 18 后面），展开前必须排序去重。",
+  "",
+  "【其它注意】",
+  "schedule_template_id 有值，但模板表不在读取层范围内，templates 需另行提供。",
+  "adapter 若用 c['id'] 取课程主键会 KeyError —— 本服务字段名是 course_id（契约用名）。",
+  "5 个任务的 duration_target_seconds 全为 null、execution_mode 全为 untimed；其中 3 个已逾期。",
+  "所以拿真实数据跑排程只能出极少数块 + 逾期/无时长说明，这是数据完整度问题，不是排程故障。"
+ ],
+ "meta": {
+  "captured_at_local": "2026-11-10 19:07 (+08)",
+  "captured_at_utc": "2026-11-10T11:07:57.481008+00:00",
+  "source": "real",
+  "data_window": {
+   "start": "2026-11-01",
+   "end": "2026-11-30"
+  },
+  "counts": {
+   "courses": 12,
+   "rules": 21,
+   "semesters": 1,
+   "overrides": 0,
+   "tasks": 5
+  },
+  "evidence": {
+   "list_tasks/tasks-wide": "trace_2b8680a8a8704476",
+   "get_calendar_events/cal-wide": "trace_5273a5808b42495a",
+   "list_tasks/tasks-empty": "trace_b682993f799d4f23"
+  },
+  "redacted": true,
+  "note": "counts 与 trace_id 均为真实值，名称已脱敏"
+ },
+ "semesters": [
+  {
+   "semester_id": "79502d87…",
+   "name": "S1",
+   "first_week_start_date": "2026-08-31",
+   "total_weeks": 18,
+   "schedule_template_id": "120a3669…",
+   "is_current": true,
+   "updated_at": "2026-10-08T06:31:03.027288+00:00"
+  }
+ ],
+ "semester_start": "2026-08-31",
+ "window": {
+  "start": "2026-11-01",
+  "end": "2026-11-30"
+ },
+ "courses": [
+  {
+   "course_id": "1c5b9396…",
+   "name": "C01",
+   "status": "active",
+   "semester": "S1",
+   "updated_at": "2026-10-08T06:31:05.51055+00:00"
+  },
+  {
+   "course_id": "bb593af7…",
+   "name": "C02",
+   "status": "active",
+   "semester": "S1",
+   "updated_at": "2026-10-08T06:31:05.315727+00:00"
+  },
+  {
+   "course_id": "dfd0e24c…",
+   "name": "C03",
+   "status": "active",
+   "semester": "S1",
+   "updated_at": "2026-10-08T06:31:05.116684+00:00"
+  },
+  {
+   "course_id": "e64f4371…",
+   "name": "C04",
+   "status": "active",
+   "semester": "S1",
+   "updated_at": "2026-10-08T06:31:04.884976+00:00"
+  },
+  {
+   "course_id": "7e78bdf0…",
+   "name": "C05",
+   "status": "active",
+   "semester": "S1",
+   "updated_at": "2026-10-08T06:31:04.694901+00:00"
+  },
+  {
+   "course_id": "1acb6ebe…",
+   "name": "C06",
+   "status": "active",
+   "semester": "S1",
+   "updated_at": "2026-10-08T06:31:04.497765+00:00"
+  },
+  {
+   "course_id": "9697f31c…",
+   "name": "C07",
+   "status": "active",
+   "semester": "S1",
+   "updated_at": "2026-10-08T06:31:04.296245+00:00"
+  },
+  {
+   "course_id": "c5b653c3…",
+   "name": "C08",
+   "status": "active",
+   "semester": "S1",
+   "updated_at": "2026-10-08T06:31:04.076155+00:00"
+  },
+  {
+   "course_id": "28011571…",
+   "name": "C09",
+   "status": "active",
+   "semester": "S1",
+   "updated_at": "2026-10-08T06:31:03.87645+00:00"
+  },
+  {
+   "course_id": "bfaa1c42…",
+   "name": "C10",
+   "status": "active",
+   "semester": "S1",
+   "updated_at": "2026-10-08T06:31:03.665508+00:00"
+  },
+  {
+   "course_id": "0e535a08…",
+   "name": "C11",
+   "status": "active",
+   "semester": "S1",
+   "updated_at": "2026-10-08T06:31:03.470853+00:00"
+  },
+  {
+   "course_id": "483f3c0e…",
+   "name": "C12",
+   "status": "active",
+   "semester": "S1",
+   "updated_at": "2026-10-08T06:31:03.315086+00:00"
+  }
+ ],
+ "rules": [
+  {
+   "rule_id": "8ad77168…",
+   "weekday": 3,
+   "week_rule_type": "odd_weeks",
+   "start_week": null,
+   "end_week": null,
+   "interval_weeks": null,
+   "week_numbers": [],
+   "start_minute": 490,
+   "end_minute": 590,
+   "course_id": "1c5b9396…",
+   "course_name": "C01"
+  },
+  {
+   "rule_id": "7f0cd7cd…",
+   "weekday": 1,
+   "week_rule_type": "every_week",
+   "start_week": null,
+   "end_week": null,
+   "interval_weeks": null,
+   "week_numbers": [],
+   "start_minute": 610,
+   "end_minute": 710,
+   "course_id": "1c5b9396…",
+   "course_name": "C01"
+  },
+  {
+   "rule_id": "d8e60c6e…",
+   "weekday": 2,
+   "week_rule_type": "custom",
+   "start_week": 3,
+   "end_week": 18,
+   "interval_weeks": null,
+   "week_numbers": [
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    16,
+    17,
+    18,
+    15
+   ],
+   "start_minute": 1120,
+   "end_minute": 1220,
+   "course_id": "bb593af7…",
+   "course_name": "C02"
+  },
+  {
+   "rule_id": "3110a420…",
+   "weekday": 5,
+   "week_rule_type": "custom",
+   "start_week": 2,
+   "end_week": 2,
+   "interval_weeks": null,
+   "week_numbers": [
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    16,
+    17,
+    18,
+    15
+   ],
+   "start_minute": 960,
+   "end_minute": 1060,
+   "course_id": "bb593af7…",
+   "course_name": "C02"
+  },
+  {
+   "rule_id": "8ac3eeec…",
+   "weekday": 3,
+   "week_rule_type": "every_week",
+   "start_week": null,
+   "end_week": null,
+   "interval_weeks": null,
+   "week_numbers": [],
+   "start_minute": 1120,
+   "end_minute": 1220,
+   "course_id": "dfd0e24c…",
+   "course_name": "C03"
+  },
+  {
+   "rule_id": "0b4dead7…",
+   "weekday": 2,
+   "week_rule_type": "every_week",
+   "start_week": null,
+   "end_week": null,
+   "interval_weeks": null,
+   "week_numbers": [],
+   "start_minute": 960,
+   "end_minute": 1060,
+   "course_id": "e64f4371…",
+   "course_name": "C04"
+  },
+  {
+   "rule_id": "10632ce9…",
+   "weekday": 2,
+   "week_rule_type": "every_week",
+   "start_week": null,
+   "end_week": null,
+   "interval_weeks": null,
+   "week_numbers": [],
+   "start_minute": 840,
+   "end_minute": 940,
+   "course_id": "7e78bdf0…",
+   "course_name": "C05"
+  },
+  {
+   "rule_id": "531dcc8c…",
+   "weekday": 5,
+   "week_rule_type": "every_week",
+   "start_week": null,
+   "end_week": 1,
+   "interval_weeks": null,
+   "week_numbers": [],
+   "start_minute": 840,
+   "end_minute": 940,
+   "course_id": "7e78bdf0…",
+   "course_name": "C05"
+  },
+  {
+   "rule_id": "97a56b16…",
+   "weekday": 5,
+   "week_rule_type": "every_week",
+   "start_week": 2,
+   "end_week": null,
+   "interval_weeks": null,
+   "week_numbers": [],
+   "start_minute": 840,
+   "end_minute": 940,
+   "course_id": "7e78bdf0…",
+   "course_name": "C05"
+  },
+  {
+   "rule_id": "7da86638…",
+   "weekday": 1,
+   "week_rule_type": "every_week",
+   "start_week": null,
+   "end_week": null,
+   "interval_weeks": null,
+   "week_numbers": [],
+   "start_minute": 840,
+   "end_minute": 940,
+   "course_id": "7e78bdf0…",
+   "course_name": "C05"
+  },
+  {
+   "rule_id": "11deedb7…",
+   "weekday": 3,
+   "week_rule_type": "every_week",
+   "start_week": null,
+   "end_week": null,
+   "interval_weeks": null,
+   "week_numbers": [],
+   "start_minute": 840,
+   "end_minute": 940,
+   "course_id": "1acb6ebe…",
+   "course_name": "C06"
+  },
+  {
+   "rule_id": "1c0028ea…",
+   "weekday": 4,
+   "week_rule_type": "every_week",
+   "start_week": null,
+   "end_week": null,
+   "interval_weeks": null,
+   "week_numbers": [],
+   "start_minute": 610,
+   "end_minute": 710,
+   "course_id": "9697f31c…",
+   "course_name": "C07"
+  },
+  {
+   "rule_id": "a3b06d54…",
+   "weekday": 5,
+   "week_rule_type": "every_week",
+   "start_week": null,
+   "end_week": null,
+   "interval_weeks": null,
+   "week_numbers": [],
+   "start_minute": 610,
+   "end_minute": 710,
+   "course_id": "9697f31c…",
+   "course_name": "C07"
+  },
+  {
+   "rule_id": "464b5a98…",
+   "weekday": 5,
+   "week_rule_type": "every_week",
+   "start_week": null,
+   "end_week": null,
+   "interval_weeks": null,
+   "week_numbers": [],
+   "start_minute": 1120,
+   "end_minute": 1220,
+   "course_id": "c5b653c3…",
+   "course_name": "C08"
+  },
+  {
+   "rule_id": "66d4bf32…",
+   "weekday": 1,
+   "week_rule_type": "every_week",
+   "start_week": null,
+   "end_week": null,
+   "interval_weeks": null,
+   "week_numbers": [],
+   "start_minute": 1120,
+   "end_minute": 1220,
+   "course_id": "c5b653c3…",
+   "course_name": "C08"
+  },
+  {
+   "rule_id": "5bc8b84d…",
+   "weekday": 3,
+   "week_rule_type": "every_week",
+   "start_week": null,
+   "end_week": null,
+   "interval_weeks": null,
+   "week_numbers": [],
+   "start_minute": 610,
+   "end_minute": 710,
+   "course_id": "28011571…",
+   "course_name": "C09"
+  },
+  {
+   "rule_id": "3e65ce77…",
+   "weekday": 4,
+   "week_rule_type": "every_week",
+   "start_week": null,
+   "end_week": null,
+   "interval_weeks": null,
+   "week_numbers": [],
+   "start_minute": 490,
+   "end_minute": 590,
+   "course_id": "28011571…",
+   "course_name": "C09"
+  },
+  {
+   "rule_id": "50c6c39f…",
+   "weekday": 2,
+   "week_rule_type": "every_week",
+   "start_week": null,
+   "end_week": null,
+   "interval_weeks": null,
+   "week_numbers": [],
+   "start_minute": 610,
+   "end_minute": 710,
+   "course_id": "bfaa1c42…",
+   "course_name": "C10"
+  },
+  {
+   "rule_id": "410576f6…",
+   "weekday": 2,
+   "week_rule_type": "even_weeks",
+   "start_week": null,
+   "end_week": null,
+   "interval_weeks": null,
+   "week_numbers": [],
+   "start_minute": 490,
+   "end_minute": 590,
+   "course_id": "0e535a08…",
+   "course_name": "C11"
+  },
+  {
+   "rule_id": "004d5efa…",
+   "weekday": 5,
+   "week_rule_type": "every_week",
+   "start_week": null,
+   "end_week": null,
+   "interval_weeks": null,
+   "week_numbers": [],
+   "start_minute": 490,
+   "end_minute": 590,
+   "course_id": "0e535a08…",
+   "course_name": "C11"
+  },
+  {
+   "rule_id": "3f9e93b2…",
+   "weekday": 1,
+   "week_rule_type": "every_week",
+   "start_week": null,
+   "end_week": null,
+   "interval_weeks": null,
+   "week_numbers": [],
+   "start_minute": 490,
+   "end_minute": 590,
+   "course_id": "483f3c0e…",
+   "course_name": "C12"
+  }
+ ],
+ "overrides": [],
+ "events_unavailable_reason": "week_expansion_not_implemented_here",
+ "tasks": [
+  {
+   "task_id": "2116742f…",
+   "kind": "recurring",
+   "name": "T1",
+   "status": "active",
+   "updated_at": "2026-10-29T07:09:19.829447+00:00",
+   "deadline": {
+    "kind": "none"
+   },
+   "duration_target_seconds": null,
+   "execution_mode": "untimed",
+   "recurrence": {
+    "preset": "daily",
+    "weekdays": [
+     1,
+     2,
+     3,
+     4,
+     5,
+     6,
+     7
+    ],
+    "starts_on": "2026-10-08",
+    "ends_on": null,
+    "scheduled_minute_of_day": null
+   }
+  },
+  {
+   "task_id": "432a6bb3…",
+   "kind": "one_time",
+   "name": "T2",
+   "status": "active",
+   "updated_at": "2026-10-09T10:03:57.650619+00:00",
+   "deadline": {
+    "kind": "date_only",
+    "date": "2026-10-11"
+   },
+   "duration_target_seconds": null,
+   "execution_mode": "untimed",
+   "available_from": null,
+   "planned_date": null
+  },
+  {
+   "task_id": "bfae17c8…",
+   "kind": "one_time",
+   "name": "T3",
+   "status": "active",
+   "updated_at": "2026-10-09T07:48:10+00:00",
+   "deadline": {
+    "kind": "date_only",
+    "date": "2026-10-10"
+   },
+   "duration_target_seconds": null,
+   "execution_mode": "untimed",
+   "available_from": null,
+   "planned_date": null
+  },
+  {
+   "task_id": "dd9c82dd…",
+   "kind": "one_time",
+   "name": "T4",
+   "status": "active",
+   "updated_at": "2026-10-08T11:28:01.420089+00:00",
+   "deadline": {
+    "kind": "date_only",
+    "date": "2026-10-17"
+   },
+   "duration_target_seconds": null,
+   "execution_mode": "untimed",
+   "available_from": null,
+   "planned_date": null
+  },
+  {
+   "task_id": "87d0fa73…",
+   "kind": "one_time",
+   "name": "T5",
+   "status": "active",
+   "updated_at": "2026-10-08T00:06:23+00:00",
+   "deadline": {
+    "kind": "none"
+   },
+   "duration_target_seconds": null,
+   "execution_mode": "untimed",
+   "available_from": null,
+   "planned_date": "2026-09-24"
+  }
+ ]
+}
