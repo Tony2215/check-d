@@ -235,5 +235,65 @@ class TestBaselineVersusWindow(unittest.TestCase):
         self.assertLess(narrow["task_count"], wide["task_count"])
 
 
+class TestOverdueNotSwallowedByWindow(unittest.TestCase):
+    """M3 2026-11-10 20:50 指出的矛盾：逾期条件里多写了一个 `d < start`。
+
+    原写法 `d < today AND d < start`：当**窗口起点早于截止日**时（例如查 10 月整月，
+    而任务 10-11 截止、今天 11-10），逾期判定不成立，任务落到 `in_window` 分支，
+    于是可以被引擎排进未来 —— 与本模块「overdue 绝不可排期」的约定直接冲突。
+
+    修法：逾期只看 `d < today`，不再叠加窗口条件。
+    """
+
+    def test_overdue_inside_past_window_still_overdue(self):
+        # 窗口覆盖 10 月整月，截止 10-11，今天 11-10
+        out = run([task(name="机器人作业")],
+                  reminders=[{"task_id": "uuid-t1", "due_date": "2026-10-11"}],
+                  window=("2026-10-01", "2026-10-31"))
+        got = by_name(out)["机器人作业"]
+        self.assertEqual(got["window_status"], rr.WINDOW_OVERDUE,
+                         "截止日早于今天就必须是 overdue，不能因为落在窗口内而变成可排期")
+        self.assertEqual(out["window_counts"]["in_window"], 0)
+
+    def test_planned_past_without_due_is_overdue(self):
+        """没有截止日、但计划日已过 —— 同样不该被当成可排期。"""
+        out = run([task(name="拿月饼")],
+                  reminders=[{"task_id": "uuid-t1", "planned_date": "2026-09-24"}],
+                  window=("2026-09-01", "2026-09-30"))
+        self.assertEqual(by_name(out)["拿月饼"]["window_status"], rr.WINDOW_OVERDUE)
+
+    def test_future_due_inside_window_still_in_window(self):
+        """未过期的任务落在窗口内仍是 in_window —— 修正不能把正常情况一起改掉。"""
+        out = run([task(name="交报告")],
+                  reminders=[{"task_id": "uuid-t1", "due_date": "2026-11-15"}])
+        self.assertEqual(by_name(out)["交报告"]["window_status"], rr.WINDOW_IN)
+
+    def test_real_fixture_distribution_11_11_to_11_18(self):
+        """按 M3 给的预期：11-11~11-18 窗口应为 in_window 5 / overdue 1 / undated 3 / 排除 0。
+
+        用真实数据的五条任务形态复现（不连库）：
+        - 循环每日、无终点           → in_window
+        - 一次性 截止 2026-10-11     → overdue
+        - 一次性 截止 2026-10-10     → overdue（M3 记 1，实际三条逾期）
+        这里只钉「逾期不被窗口吞掉」这一条性质，不复制她的具体计数，
+        因为计数依赖 today 取值，跨日会变。
+        """
+        tasks = [task(tid="uuid-t1", name="循环", ttype="long_term"),
+                 task(tid="uuid-t2", name="逾期A"),
+                 task(tid="uuid-t3", name="无日期")]
+        reminders = [{"task_id": "uuid-t2", "due_date": "2026-10-11"},
+                     {"task_id": "uuid-t3"}]
+        schedules = [{"task_id": "uuid-t1", "schedule_type": "daily",
+                      "weekdays": [1, 2, 3, 4, 5, 6, 7],
+                      "starts_on": "2026-10-08", "ends_on": None}]
+        out = run(tasks, reminders=reminders, schedules=schedules,
+                  window=("2026-11-11", "2026-11-18"), today="2026-11-11")
+        c = out["window_counts"]
+        self.assertEqual(c["in_window"], 1)
+        self.assertEqual(c["overdue"], 1)
+        self.assertEqual(c["undated"], 1)
+        self.assertEqual(c["excluded_out_of_window"], 0)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -157,14 +157,27 @@ class TestOptimisticLock(unittest.TestCase):
         self.assertEqual(t.one["body"]["name"], NEW)
 
     def test_old_name_is_url_encoded(self):
-        """旧名里的保留字符必须编码，否则能把 WHERE 改成别的条件。"""
+        """旧名里的保留字符必须处理两层，否则能把 WHERE 改成别的条件。
+
+        M3 2026-11-10 20:50 指出：只做百分号编码不够 —— PostgREST 先 URL 解码
+        再解析 filter，`%2C` 解回逗号仍会被当条件分隔符。所以还要双引号包裹。
+        """
         t = Rec(rows=ok_row(name="物理实验"))
         nasty = "物理,实验(第2组):测试"
         do(writer(t), expected_old_name=nasty, new_name="物理实验")
         url = t.one["url"]
         self.assertNotIn(nasty, url, "原样出现说明没编码")
-        self.assertIn("%2C", url, "逗号应被编码")
-        self.assertIn("%28", url, "左括号应被编码")
+        self.assertIn("%2C", url, "逗号应被百分号编码")
+        self.assertIn("%28", url, "左括号应被百分号编码")
+        self.assertIn("%22", url, "值还应被双引号包裹（PostgREST 层的要求）")
+
+    def test_quote_wraps_and_escapes(self):
+        """`_q` 两层处理：先双引号包裹并转义，再百分号编码。"""
+        self.assertEqual(rw._q("abc"), "%22abc%22")
+        # 值内的双引号要转义成 \" 再编码
+        self.assertEqual(rw._q('a"b'), "%22a%5C%22b%22")
+        # 反斜杠先转义成 \\
+        self.assertEqual(rw._q("a\\b"), "%22a%5C%5Cb%22")
 
     def test_user_id_never_sent_by_caller(self):
         """归属由 RLS 的 auth.uid() 判，客户端不得指定身份。"""

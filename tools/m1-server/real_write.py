@@ -55,9 +55,21 @@ _RESERVED = (",", ".", "(", ")", ":", '"')
 def _q(value):
     """把值编码成 PostgREST filter 里可安全使用的形式。
 
-    `safe=""` 连 `/` 也编码，因为这个值只会出现在 query 里，不会当路径用。
+    **两层，缺一不可**：
+    1. 按 PostgREST 规则用双引号包裹，值内的反斜杠与引号转义；
+    2. 整体做 URL 百分号编码。
+
+    2026-11-10 20:50 M3 指出只做第 2 层不够：PostgREST 是**先 URL 解码、
+    再解析 filter**，所以 `%2C` 解回逗号后仍会被当作条件分隔符。
+    官方对含 `, . ( ) : "` 的值建议用双引号包裹。
+
+    这一条**尚未在真实 PostgREST 上验证过**（写通道未启用、无 JWT），
+    属疑点而非定论；隔离验证时应拿一条含逗号的名称打一次 PATCH 来定论。
+    在此之前，现场使用的任务名请避开这六个字符。
     """
-    return urllib.parse.quote(str(value), safe="")
+    s = str(value)
+    quoted = '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
+    return urllib.parse.quote(quoted, safe="")
 
 
 def patch_transport(url, headers, timeout, body):
@@ -179,8 +191,10 @@ class RealWrite:
 
         # 3) 组装条件更新
         #    WHERE: id 精确 + name 等于旧值（乐观锁）+ 未软删
+        #    id 已由 `_UUID_RE` 限死为十六进制与连字符，不含 filter 保留字符，
+        #    所以不套引号（套了反而多一层可能出错的语法）；name 是自由文本，必须走 `_q`。
         query = "?id=eq.%s&name=eq.%s&deleted_at=is.null" % (
-            _q(task_id), _q(expected_old_name))
+            urllib.parse.quote(task_id, safe=""), _q(expected_old_name))
         url = "%s/rest/v1/%s%s" % (self.base_url, self.TABLE, query)
         body = json.dumps({"name": new_name}, ensure_ascii=False).encode("utf-8")
 

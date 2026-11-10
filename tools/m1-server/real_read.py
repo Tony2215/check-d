@@ -388,10 +388,16 @@ def _classify_task(task, start, end, today):
     if not planned and not due:
         return WINDOW_UNDATED, "未设置计划日与截止日，无法判断落在哪个时段"
 
-    # 逾期优先于窗口：逾期任务必须单独可见，不能被"窗口外"悄悄吃掉。
-    for d, label in ((due, "截止日"), (planned, "计划日")):
-        if d and d < today and d < start:
-            return WINDOW_OVERDUE, "%s %s 已过期，不再排入未来时段" % (label, d)
+    # 逾期判定只看「是否早于今天」，**不叠加 `d < start`**。
+    # 2026-11-10 20:50 M3 指出原写法有矛盾：当窗口起点早于截止日时，
+    # 逾期任务会落到下面的 in_window 分支，从而可被引擎排进未来——
+    # 与本文件开头写的「overdue 绝不可排期」自相矛盾。
+    # 正确语义是：已经过去的事，无论窗口从哪天开始，都属于逾期。
+    if due and due < today:
+        return WINDOW_OVERDUE, "截止日 %s 已过期，不再排入未来时段" % due
+    # 没有截止日但有计划日：计划日已过也视为逾期（拖过计划日仍未完成）。
+    if not due and planned and planned < today:
+        return WINDOW_OVERDUE, "计划日 %s 已过期，不再排入未来时段" % planned
 
     for d, label in ((planned, "计划日"), (due, "截止日")):
         if d and start <= d <= end:
